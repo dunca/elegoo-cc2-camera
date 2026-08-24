@@ -1,6 +1,6 @@
 # ==============================================================================
-# Makefile for ai_camera_replacement
-# Drop-in replacement for Elegoo Centauri Carbon (and TinaLinux/ARM) ai_camera
+# Makefile for ai_camera replacement
+# Drop-in replacement for Elegoo Centauri Carbon 2 ai_camera
 # ==============================================================================
 
 TARGET ?= ai_camera
@@ -12,7 +12,9 @@ SRCS = src/main.c \
        src/v4l2_camera.c \
        src/http_server.c \
        src/uds_ipc.c \
-       src/timelapse_encoder.c
+       src/timelapse_encoder.c \
+       src/db_sync.c \
+       src/sqlite3.c
 
 OBJS_ARM = $(patsubst src/%.c, $(BUILD_DIR)/arm/obj/%.o, $(SRCS))
 DEPS_ARM = $(OBJS_ARM:.o=.d)
@@ -20,11 +22,11 @@ DEPS_ARM = $(OBJS_ARM:.o=.d)
 OBJS_HOST = $(patsubst src/%.c, $(BUILD_DIR)/host/obj/%.o, $(SRCS))
 DEPS_HOST = $(OBJS_HOST:.o=.d)
 
-VERSION ?= 0.2.1
+VERSION ?= 0.2.2
 GIT_VER = $(shell git describe --tags --always --dirty 2>/dev/null || echo "v$(VERSION)")
 
 # Compiler flags
-COMMON_CFLAGS = -O3 -Wall -Wextra -Isrc -D_GNU_SOURCE -DAPP_VERSION=\"$(VERSION)\" -DGIT_VERSION=\"$(GIT_VER)\" -MMD -MP
+COMMON_CFLAGS = -O3 -Wall -Wextra -Isrc -D_GNU_SOURCE -DAPP_VERSION=\"$(VERSION)\" -DGIT_VERSION=\"$(GIT_VER)\" -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DQS=0 -MMD -MP
 
 # ------------------------------------------------------------------------------
 # ARM Cross-Compilation Configuration

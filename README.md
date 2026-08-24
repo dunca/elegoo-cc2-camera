@@ -1,6 +1,6 @@
 # ai_camera
 
-A lightweight replacement for the stock ai_camera service on the Elegoo Centauri Carbon 2. Supports higher resolution streaming and timelapses while (hopefully) being less prone to crashing.
+A lightweight replacement for the stock ai_camera service on the Elegoo Centauri Carbon 2. Supports higher resolution streaming, timelapses and auto-encoding while (hopefully) being less prone to crashing.
 
 ---
 
@@ -60,6 +60,7 @@ This project is made possible thanks to the following open-source libraries:
 - **[minimp4](https://github.com/lieff/minimp4)**
 - **[stb_image](https://github.com/nothings/stb)**
 - **[musl libc](https://musl.libc.org/)** & **[musl-cross](https://musl.cc/)**
+- **[sqlite](https://sqlite.org/)**
 
 ---
 
