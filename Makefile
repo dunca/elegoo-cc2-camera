@@ -22,7 +22,7 @@ DEPS_ARM = $(OBJS_ARM:.o=.d)
 OBJS_HOST = $(patsubst src/%.c, $(BUILD_DIR)/host/obj/%.o, $(SRCS))
 DEPS_HOST = $(OBJS_HOST:.o=.d)
 
-VERSION ?= 0.2.2
+VERSION ?= 0.2.3
 GIT_VER = $(shell git describe --tags --always --dirty 2>/dev/null || echo "v$(VERSION)")
 
 # Compiler flags

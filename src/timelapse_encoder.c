@@ -295,18 +295,32 @@ typedef struct {
     char image_dir[256];
     char output_mp4[256];
     int fps;
+    int delay_sec;
+    timelapse_start_cb start_cb;
     timelapse_progress_cb prog_cb;
     timelapse_finish_cb finish_cb;
     void *user_data;
 } async_encode_args_t;
 
 #include <sys/resource.h>
+#include <unistd.h>
 
 static void *async_encode_worker(void *arg) {
     // Avoid taking priority over printer processes
     setpriority(PRIO_PROCESS, 0, 19);
 
     async_encode_args_t *args = (async_encode_args_t *)arg;
+
+    // Optional delay to give printer time to record task completion
+    if (args->delay_sec > 0) {
+        printf("[timelapse] Waiting %d seconds before starting composite...\n", args->delay_sec);
+        sleep(args->delay_sec);
+    }
+
+    if (args->start_cb) {
+        args->start_cb(args->output_mp4, args->user_data);
+    }
+
     int res = timelapse_encode_directory(args->image_dir, args->output_mp4, args->fps, 0, 0,
                                          args->prog_cb, args->user_data);
     long sz = 0;
@@ -326,6 +340,8 @@ static void *async_encode_worker(void *arg) {
 }
 
 int timelapse_encode_directory_async(const char *image_dir, const char *output_mp4, int fps,
+                                     int delay_sec,
+                                     timelapse_start_cb start_cb,
                                      timelapse_progress_cb prog_cb,
                                      timelapse_finish_cb finish_cb,
                                      void *user_data) {
@@ -337,6 +353,8 @@ int timelapse_encode_directory_async(const char *image_dir, const char *output_m
     snprintf(args->image_dir, sizeof(args->image_dir), "%s", image_dir);
     snprintf(args->output_mp4, sizeof(args->output_mp4), "%s", output_mp4);
     args->fps = fps > 0 ? fps : 15;
+    args->delay_sec = delay_sec > 0 ? delay_sec : 0;
+    args->start_cb = start_cb;
     args->prog_cb = prog_cb;
     args->finish_cb = finish_cb;
     args->user_data = user_data;

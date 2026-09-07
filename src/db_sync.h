@@ -21,6 +21,14 @@ int db_sync_update_timelapse(const char *video_filename, long video_size);
  */
 int db_sync_all_timelapses(void);
 
+/**
+ * Removes ghost timelapse records (where status > 0 but URL is invalid or video file doesn't exist)
+ * by resetting their time_lapse_video_* columns in elegoo.db
+ *
+ * @return Number of ghost records cleaned, or negative on error
+ */
+int db_sync_cleanup_ghost_entries(void);
+
 #ifdef __cplusplus
 }
 #endif

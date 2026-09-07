@@ -8,6 +8,7 @@
 extern "C" {
 #endif
 
+typedef void (*timelapse_start_cb)(const char *output_mp4, void *user_data);
 typedef void (*timelapse_progress_cb)(int current_frame, int total_frames, void *user_data);
 typedef void (*timelapse_finish_cb)(const char *output_mp4, long file_size, int success, void *user_data);
 
@@ -18,9 +19,11 @@ int timelapse_encode_directory(const char *image_dir, const char *output_mp4, in
                                timelapse_progress_cb prog_cb, void *user_data);
 
 /**
- * Starts encoding in a detached background thread with progress & finish callbacks.
+ * Starts encoding in a detached background thread with optional initial delay and callbacks.
  */
 int timelapse_encode_directory_async(const char *image_dir, const char *output_mp4, int fps,
+                                     int delay_sec,
+                                     timelapse_start_cb start_cb,
                                      timelapse_progress_cb prog_cb,
                                      timelapse_finish_cb finish_cb,
                                      void *user_data);

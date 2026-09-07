@@ -101,6 +101,22 @@ static void save_timelapse_snapshot(frame_ring_t *ring, const char *filepath) {
     free(frame_buf);
 }
 
+static void on_composite_start(const char *output_mp4, void *user_data) {
+    composite_callback_ctx_t *ctx = (composite_callback_ctx_t *)user_data;
+    if (!ctx || !ctx->ipc) return;
+
+    char path_buf[256];
+    snprintf(path_buf, sizeof(path_buf), "%s", output_mp4);
+    char *base = basename(path_buf);
+
+    printf("[uds_ipc] Broadcasting Time-Lapse Composite Video Start for '%s'\n", base);
+    char start_report[512];
+    snprintf(start_report, sizeof(start_report),
+             "{\"id\":-1,\"method\":\"status_report\",\"result\":{\"level\":\"info\",\"message\":\"Time-Lapse Composite Video Start\",\"video_name\":\"%s\"}}\x03",
+             base);
+    uds_ipc_broadcast(ctx->ipc, start_report);
+}
+
 static void on_composite_progress(int current, int total, void *user_data) {
     composite_callback_ctx_t *ctx = (composite_callback_ctx_t *)user_data;
     if (!ctx || !ctx->ipc || total <= 0) return;
@@ -251,19 +267,20 @@ static void process_ipc_message(uds_ipc_t *ipc, int client_fd, const char *msg) 
             printf("[uds_ipc] Timelapse session continued\n");
             snprintf(status_str, sizeof(status_str), "Continue");
         } else if (is_stop) {
-            char final_dir[256];
-            char final_file[256];
-            snprintf(final_file, sizeof(final_file), "%s", ipc->current_lapse_filename);
-            snprintf(final_dir, sizeof(final_dir), "/opt/usr/picture/%s", final_file);
-            if (ipc->current_lapse_dir[0]) {
-                rename(ipc->current_lapse_dir, final_dir);
+            // Check if a timelapse session was ever started
+            if (!ipc->current_lapse_filename[0] || !ipc->current_lapse_dir[0]) {
+                printf("[uds_ipc] Timelapse stop requested, but no active session was started. Returning fail to caller.\n");
+                char fail_resp[256];
+                int flen = snprintf(fail_resp, sizeof(fail_resp),
+                                    "{\"id\":%s,\"method\":\"time_lapse\",\"result\":\"fail\",\"status\":\"TimeLapseStop\",\"reason\":\"NO Camera or isTimelapsePhotographyActive_ is not Start!!!\"}\x03",
+                                    id[0] ? id : "null");
+                send(client_fd, fail_resp, flen, MSG_NOSIGNAL);
+                return;
             }
-            unlink("/tmp/pic_link");
-            symlink(final_dir, "/tmp/pic_link");
 
             int frame_count = ipc->current_frame_index;
             if (frame_count <= 0) {
-                DIR *d = opendir(final_dir);
+                DIR *d = opendir(ipc->current_lapse_dir);
                 if (d) {
                     struct dirent *ent;
                     while ((ent = readdir(d)) != NULL) {
@@ -275,8 +292,37 @@ static void process_ipc_message(uds_ipc_t *ipc, int client_fd, const char *msg) 
                 }
             }
 
-            int duration = (frame_count > 0 ? (frame_count / 15) : 0);
-            if (duration == 0 && frame_count > 0) duration = 1;
+            // If zero frames were captured (e.g. print cancelled before first layer change), do not record as timelapse
+            if (frame_count <= 0) {
+                printf("[uds_ipc] Timelapse stop requested, but 0 frames were captured in '%s'. Cleaning up and returning fail.\n",
+                       ipc->current_lapse_dir);
+                char rm_cmd[300];
+                snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf \"%s\"", ipc->current_lapse_dir);
+                system(rm_cmd);
+                unlink("/tmp/pic_link");
+
+                ipc->current_lapse_dir[0] = '\0';
+                ipc->current_lapse_filename[0] = '\0';
+                ipc->current_frame_index = 0;
+
+                char fail_resp[256];
+                int flen = snprintf(fail_resp, sizeof(fail_resp),
+                                    "{\"id\":%s,\"method\":\"time_lapse\",\"result\":\"fail\",\"status\":\"TimeLapseStop\",\"reason\":\"End halfway without saving the final result!!!\"}\x03",
+                                    id[0] ? id : "null");
+                send(client_fd, fail_resp, flen, MSG_NOSIGNAL);
+                return;
+            }
+
+            char final_dir[256];
+            char final_file[256];
+            snprintf(final_file, sizeof(final_file), "%s", ipc->current_lapse_filename);
+            snprintf(final_dir, sizeof(final_dir), "/opt/usr/picture/%s", final_file);
+            rename(ipc->current_lapse_dir, final_dir);
+            unlink("/tmp/pic_link");
+            symlink(final_dir, "/tmp/pic_link");
+
+            int duration = (frame_count / 15);
+            if (duration == 0) duration = 1;
 
             printf("[uds_ipc] Timelapse session stopped (captured %d frames in '%s')\n",
                    frame_count, final_dir);
@@ -293,30 +339,19 @@ static void process_ipc_message(uds_ipc_t *ipc, int client_fd, const char *msg) 
             ipc->current_lapse_filename[0] = '\0';
             ipc->current_frame_index = 0;
 
-            if (ipc->auto_composite && frame_count > 0 && final_file[0]) {
+            if (ipc->auto_composite && final_file[0]) {
                 composite_callback_ctx_t *ctx = malloc(sizeof(*ctx));
                 if (ctx) {
                     ctx->ipc = ipc;
                     snprintf(ctx->target_dir, sizeof(ctx->target_dir), "%s", final_dir);
                     snprintf(ctx->out_video, sizeof(ctx->out_video), "/opt/usr/video/%s.mp4", final_file);
 
-                    char out_copy[256];
-                    snprintf(out_copy, sizeof(out_copy), "%s", ctx->out_video);
-                    char *base_name = basename(out_copy);
-
-                    printf("[uds_ipc] Auto-encoding timelapse on stop: '%s' -> '%s' (nice 19)\n",
+                    printf("[uds_ipc] Scheduling auto-encoding on stop (3s delay for printer task_record save): '%s' -> '%s' (nice 19)\n",
                            ctx->target_dir, ctx->out_video);
 
-                    // Allow elegoo_printer time to process TimeLapseStop before sending start report
-                    usleep(50000);
-
-                    char start_report[512];
-                    snprintf(start_report, sizeof(start_report),
-                             "{\"id\":-1,\"method\":\"status_report\",\"result\":{\"level\":\"info\",\"message\":\"Time-Lapse Composite Video Start\",\"video_name\":\"%s\"}}\x03",
-                             base_name);
-                    uds_ipc_broadcast(ipc, start_report);
-
                     timelapse_encode_directory_async(ctx->target_dir, ctx->out_video, 15,
+                                                     3, // 3-second delay gives elegoo_printer time to run save_task()
+                                                     on_composite_start,
                                                      on_composite_progress, on_composite_finish, ctx);
                 }
             }
@@ -380,24 +415,24 @@ static void process_ipc_message(uds_ipc_t *ipc, int client_fd, const char *msg) 
                          base_name);
                 uds_ipc_broadcast(ipc, start_report);
 
+                usleep(50000); // 50ms spacing so elegoo_printer handles start before finish
+
                 char finish_report[512];
                 snprintf(finish_report, sizeof(finish_report),
                          "{\"id\":-1,\"method\":\"status_report\",\"result\":{\"level\":\"info\",\"message\":\"Time-Lapse Composite Video Finish\",\"video_name\":\"%s\",\"video_path\":\"%s\",\"video_size\":%lld}}\x03",
                          base_name, ctx->out_video, (long long)st_video.st_size);
                 uds_ipc_broadcast(ipc, finish_report);
 
+                db_sync_update_timelapse(base_name, (long)st_video.st_size);
+
                 free(ctx);
             } else {
-                printf("[uds_ipc] Triggering timelapse video composite: '%s' -> '%s' @ %d fps\n",
+                printf("[uds_ipc] Triggering on-demand timelapse composite: '%s' -> '%s' @ %d fps\n",
                        ctx->target_dir, ctx->out_video, fps);
 
-                char start_report[512];
-                snprintf(start_report, sizeof(start_report),
-                         "{\"id\":-1,\"method\":\"status_report\",\"result\":{\"level\":\"info\",\"message\":\"Time-Lapse Composite Video Start\",\"video_name\":\"%s\"}}\x03",
-                         base_name);
-                uds_ipc_broadcast(ipc, start_report);
-
                 timelapse_encode_directory_async(ctx->target_dir, ctx->out_video, fps,
+                                                 0, // 0 delay for on-demand manual composite requests
+                                                 on_composite_start,
                                                  on_composite_progress, on_composite_finish, ctx);
             }
         }
@@ -659,8 +694,13 @@ int uds_ipc_sync_all_timelapses(const char *socket_path) {
                         char rm_cmd[600];
                         snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf \"%s\"", pic_dir);
                         system(rm_cmd);
+                    } else if (res == -2) {
+                        printf("[sync] Cleaning up empty/abandoned picture directory '%s'\n", pic_dir);
+                        char rm_cmd[600];
+                        snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf \"%s\"", pic_dir);
+                        system(rm_cmd);
                     } else {
-                        fprintf(stderr, "[sync] Failed to encode: '%s'\n", pic_dir);
+                        fprintf(stderr, "[sync] Failed to encode: '%s' (err %d)\n", pic_dir, res);
                     }
                 } else {
                     printf("[sync] Video '%s' already exists, cleaning up redundant picture directory '%s'\n",
@@ -716,6 +756,10 @@ int uds_ipc_sync_all_timelapses(const char *socket_path) {
     printf("[sync] Updating elegoo.db database records...\n");
     int db_count = db_sync_all_timelapses();
     printf("[sync] Updated %d database record(s) in elegoo.db.\n", db_count);
+
+    printf("[sync] Cleaning up ghost timelapse records in elegoo.db...\n");
+    int ghost_count = db_sync_cleanup_ghost_entries();
+    printf("[sync] Cleaned %d ghost timelapse record(s) in elegoo.db.\n", ghost_count);
 
     printf("[sync] Timelapse synchronization complete.\n");
     return 0;
