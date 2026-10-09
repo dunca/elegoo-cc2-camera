@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <x264.h>
 #ifdef HAVE_TURBOJPEG
 #include <turbojpeg.h>
@@ -182,6 +183,68 @@ static int load_frame_i420(frame_decoder_t *d, const char *path, int width, int 
     return 0;
 }
 
+static void encode_picture(x264_t *encoder, mp4_h26x_writer_t *writer, x264_picture_t *pic, uint32_t frame_duration_90k) {
+    x264_picture_t pic_out;
+    x264_nal_t *nals;
+    int i_nals = 0;
+    int frame_size = x264_encoder_encode(encoder, &nals, &i_nals, pic, &pic_out);
+    if (frame_size > 0) {
+        for (int n = 0; n < i_nals; n++) {
+            mp4_h26x_write_nal(writer, nals[n].p_payload, nals[n].i_payload, frame_duration_90k);
+        }
+    }
+}
+
+// Two-stage pipeline: a decoder thread fills one picture while x264 encodes the other, so JPEG
+// decoding and H.264 encoding run on the CC2's two cores at once. Slots are filled and consumed
+// strictly in order; x264 copies its input during x264_encoder_encode, so a slot is free again as
+// soon as that call returns.
+#define PIPELINE_SLOTS 2
+
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    x264_picture_t pics[PIPELINE_SLOTS];
+    int full[PIPELINE_SLOTS];     // decoded and waiting for the encoder
+    int64_t pts[PIPELINE_SLOTS];  // frame index of each slot's picture
+    int done;                     // decoder has handed over every readable frame
+    char **files;
+    size_t count;
+    int width, height;
+    int nice_value;               // Linux nice is per thread: the decoder runs at the encoder's
+    frame_decoder_t decoder;
+} decode_pipeline_t;
+
+static void *decode_thread_proc(void *arg) {
+    decode_pipeline_t *p = (decode_pipeline_t *)arg;
+    setpriority(PRIO_PROCESS, 0, p->nice_value);
+
+    int slot = 0;
+    for (size_t i = 0; i < p->count; i++) {
+        pthread_mutex_lock(&p->lock);
+        while (p->full[slot]) pthread_cond_wait(&p->cond, &p->lock);
+        pthread_mutex_unlock(&p->lock);
+
+        if (load_frame_i420(&p->decoder, p->files[i], p->width, p->height, &p->pics[slot]) != 0) {
+            fprintf(stderr, "[timelapse] Warning: Skipping unreadable frame '%s'\n", p->files[i]);
+            continue;
+        }
+
+        pthread_mutex_lock(&p->lock);
+        p->pts[slot] = (int64_t)i;
+        p->full[slot] = 1;
+        pthread_cond_broadcast(&p->cond);
+        pthread_mutex_unlock(&p->lock);
+        slot = (slot + 1) % PIPELINE_SLOTS;
+    }
+
+    pthread_mutex_lock(&p->lock);
+    p->done = 1;
+    pthread_cond_broadcast(&p->cond);
+    pthread_mutex_unlock(&p->lock);
+    return NULL;
+}
+
 int timelapse_encode_directory(const char *image_dir, const char *output_mp4, int fps, int width, int height,
                                timelapse_progress_cb cb, void *user_data) {
     if (!image_dir || !output_mp4) return -1;
@@ -316,52 +379,77 @@ int timelapse_encode_directory(const char *image_dir, const char *output_mp4, in
         return -7;
     }
 
-    x264_picture_t pic_in, pic_out;
-    x264_picture_alloc(&pic_in, X264_CSP_I420, width, height);
-
     printf("[timelapse] Encoding %zu frames to '%s' (%dx%d @ %d fps)...\n",
            file_count, output_mp4, width, height, fps);
 
     uint32_t timescale = 90000;
     uint32_t frame_duration_90k = timescale / fps;
 
-    frame_decoder_t decoder;
-    frame_decoder_init(&decoder);
+    decode_pipeline_t pipe;
+    memset(&pipe, 0, sizeof(pipe));
+    pthread_mutex_init(&pipe.lock, NULL);
+    pthread_cond_init(&pipe.cond, NULL);
+    for (int s = 0; s < PIPELINE_SLOTS; s++) {
+        x264_picture_alloc(&pipe.pics[s], X264_CSP_I420, width, height);
+    }
+    pipe.files = file_list;
+    pipe.count = file_count;
+    pipe.width = width;
+    pipe.height = height;
+    pipe.nice_value = getpriority(PRIO_PROCESS, 0);
+    frame_decoder_init(&pipe.decoder);
 
-    for (size_t i = 0; i < file_count; i++) {
-        if (load_frame_i420(&decoder, file_list[i], width, height, &pic_in) != 0) {
-            fprintf(stderr, "[timelapse] Warning: Skipping unreadable frame '%s'\n", file_list[i]);
-            continue;
+    pthread_t decode_thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+    int threaded = (pthread_create(&decode_thread, &attr, decode_thread_proc, &pipe) == 0);
+    pthread_attr_destroy(&attr);
+
+    if (threaded) {
+        int slot = 0;
+        for (;;) {
+            pthread_mutex_lock(&pipe.lock);
+            while (!pipe.full[slot] && !pipe.done) pthread_cond_wait(&pipe.cond, &pipe.lock);
+            int have_frame = pipe.full[slot];
+            pthread_mutex_unlock(&pipe.lock);
+            if (!have_frame) break; // decoder done and every decoded frame encoded
+
+            pipe.pics[slot].i_pts = pipe.pts[slot];
+            encode_picture(encoder, &mp4_writer, &pipe.pics[slot], frame_duration_90k);
+            if (cb) cb((int)pipe.pts[slot] + 1, (int)file_count, user_data);
+
+            pthread_mutex_lock(&pipe.lock);
+            pipe.full[slot] = 0;
+            pthread_cond_broadcast(&pipe.cond);
+            pthread_mutex_unlock(&pipe.lock);
+            slot = (slot + 1) % PIPELINE_SLOTS;
         }
-
-        pic_in.i_pts = i;
-
-        x264_nal_t *nals;
-        int i_nals = 0;
-        int frame_size = x264_encoder_encode(encoder, &nals, &i_nals, &pic_in, &pic_out);
-        if (frame_size > 0) {
-            for (int n = 0; n < i_nals; n++) {
-                mp4_h26x_write_nal(&mp4_writer, nals[n].p_payload, nals[n].i_payload, frame_duration_90k);
+        pthread_join(decode_thread, NULL);
+    } else {
+        // No second thread available: decode and encode in turn.
+        for (size_t i = 0; i < file_count; i++) {
+            if (load_frame_i420(&pipe.decoder, file_list[i], width, height, &pipe.pics[0]) != 0) {
+                fprintf(stderr, "[timelapse] Warning: Skipping unreadable frame '%s'\n", file_list[i]);
+                continue;
             }
+            pipe.pics[0].i_pts = i;
+            encode_picture(encoder, &mp4_writer, &pipe.pics[0], frame_duration_90k);
+            if (cb) cb((int)i + 1, (int)file_count, user_data);
         }
-
-        if (cb) cb((int)i + 1, (int)file_count, user_data);
     }
 
     // Flush encoder
     while (x264_encoder_delayed_frames(encoder) > 0) {
-        x264_nal_t *nals;
-        int i_nals = 0;
-        int frame_size = x264_encoder_encode(encoder, &nals, &i_nals, NULL, &pic_out);
-        if (frame_size > 0) {
-            for (int n = 0; n < i_nals; n++) {
-                mp4_h26x_write_nal(&mp4_writer, nals[n].p_payload, nals[n].i_payload, frame_duration_90k);
-            }
-        }
+        encode_picture(encoder, &mp4_writer, NULL, frame_duration_90k);
     }
 
-    frame_decoder_cleanup(&decoder);
-    x264_picture_clean(&pic_in);
+    frame_decoder_cleanup(&pipe.decoder);
+    for (int s = 0; s < PIPELINE_SLOTS; s++) {
+        x264_picture_clean(&pipe.pics[s]);
+    }
+    pthread_cond_destroy(&pipe.cond);
+    pthread_mutex_destroy(&pipe.lock);
     x264_encoder_close(encoder);
     mp4_h26x_write_close(&mp4_writer);
     MP4E_close(mux);
