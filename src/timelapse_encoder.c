@@ -1,5 +1,8 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_JPEG
+#if defined(__ARM_NEON)
+#define STBI_NEON // stb_image only uses NEON when asked to (IDCT, YCbCr->RGB, chroma upsampling)
+#endif
 #include "stb_image.h"
 
 #define MINIMP4_IMPLEMENTATION
