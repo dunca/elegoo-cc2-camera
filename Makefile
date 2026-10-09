@@ -45,7 +45,7 @@ else
 endif
 
 ARM_PREFIX = $(BUILD_DIR)/arm/sysroot
-ARM_CFLAGS = $(COMMON_CFLAGS) -I$(ARM_PREFIX)/include
+ARM_CFLAGS = $(COMMON_CFLAGS) -mcpu=cortex-a7 -mfpu=neon-vfpv4 -I$(ARM_PREFIX)/include
 ARM_LDFLAGS = -L$(ARM_PREFIX)/lib -static -s -pthread -lx264 -lm
 
 # ------------------------------------------------------------------------------
