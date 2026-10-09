@@ -94,7 +94,7 @@ EOF
     -DCMAKE_TOOLCHAIN_FILE="$TC/toolchain.cmake" -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$SYSROOT" -DCMAKE_INSTALL_LIBDIR=lib -DENABLE_SHARED=OFF -DENABLE_STATIC=ON \
     -DWITH_TURBOJPEG=ON -DWITH_JAVA=OFF -DWITH_TOOLS=OFF -DWITH_TESTS=OFF -DWITH_SIMD=ON \
-    -DREQUIRE_SIMD=ON > "$OUT/libjpeg-turbo.configure.log"
+    -DREQUIRE_SIMD=ON -DNEON_INTRINSICS=ON > "$OUT/libjpeg-turbo.configure.log"
   cmake --build "$OUT/libjpeg-turbo" -j"$(getconf _NPROCESSORS_ONLN)" > "$OUT/libjpeg-turbo.make.log"
   cmake --install "$OUT/libjpeg-turbo" > /dev/null
 fi
