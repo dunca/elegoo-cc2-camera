@@ -1,6 +1,13 @@
-// Per-stage timing of the timelapse encoder: file read, JPEG decode, RGB->YUV, x264 encode.
-// Uses the exact code paths from src/timelapse_encoder.c (included directly).
+// Per-stage timing of the timelapse encoder on the printer, using the exact code in
+// src/timelapse_encoder.c (included directly).
+//
+//   stagebench FRAME.jpeg...
+//
+// For every frame: the original path (stb_image -> RGB -> rgb24_to_yuv420p), the current
+// load_frame_i420() path (libjpeg-turbo straight to YUV when built with HAVE_TURBOJPEG), the
+// x264 encode, and the PSNR between the two decode paths' YUV output.
 #include "../src/timelapse_encoder.c"
+#include <math.h>
 #include <time.h>
 
 static double now(void) {
@@ -9,11 +16,22 @@ static double now(void) {
     return t.tv_sec + t.tv_nsec / 1e9;
 }
 
+static double plane_mse(const uint8_t *a, const uint8_t *b, size_t n) {
+    double s = 0;
+    for (size_t i = 0; i < n; i++) {
+        int d = (int)a[i] - (int)b[i];
+        s += d * d;
+    }
+    return s / n;
+}
+
+static double psnr(double mse) { return mse == 0 ? 99.0 : 10 * log10(255.0 * 255.0 / mse); }
+
 int main(int argc, char **argv) {
     int n = argc - 1;
     if (n < 1) return 1;
     int W = 1280, H = 720;
-    double tr = 0, td = 0, tc = 0, te = 0;
+    double t_old = 0, t_new = 0, t_enc = 0, mse_y = 0, mse_c = 0, worst = 99;
 
     x264_param_t p;
     x264_param_default_preset(&p, "ultrafast", "zerolatency");
@@ -22,35 +40,46 @@ int main(int argc, char **argv) {
     p.i_threads = 1; p.i_lookahead_threads = 0; p.rc.i_lookahead = 0; p.i_bframe = 0;
     p.rc.i_rc_method = X264_RC_CRF; p.rc.f_rf_constant = 26.0;
     x264_param_apply_profile(&p, "baseline");
+    p.i_log_level = X264_LOG_NONE;
     x264_t *e = x264_encoder_open(&p);
-    x264_picture_t pi, po;
-    x264_picture_alloc(&pi, X264_CSP_I420, W, H);
+    x264_picture_t pic_new, pic_old, po;
+    x264_picture_alloc(&pic_new, X264_CSP_I420, W, H);
+    x264_picture_alloc(&pic_old, X264_CSP_I420, W, H);
+    frame_decoder_t dec;
+    frame_decoder_init(&dec);
 
     for (int i = 0; i < n; i++) {
+        // Original path, including reading the file as stbi_load() does.
         double t0 = now();
-        FILE *f = fopen(argv[i + 1], "rb");
-        fseek(f, 0, SEEK_END);
-        long sz = ftell(f);
-        rewind(f);
-        unsigned char *jb = malloc(sz);
-        fread(jb, 1, sz, f);
-        fclose(f);
-        double t1 = now();
         int w, h, c;
-        unsigned char *rgb = stbi_load_from_memory(jb, sz, &w, &h, &c, 3);
-        free(jb);
-        double t2 = now();
-        rgb24_to_yuv420p(rgb, W, H, pi.img.plane[0], pi.img.plane[1], pi.img.plane[2]);
+        uint8_t *rgb = stbi_load(argv[i + 1], &w, &h, &c, 3);
+        if (!rgb) return 2;
+        rgb24_to_yuv420p(rgb, W, H, pic_old.img.plane[0], pic_old.img.plane[1], pic_old.img.plane[2]);
         stbi_image_free(rgb);
-        double t3 = now();
-        pi.i_pts = i;
+        double t1 = now();
+        if (load_frame_i420(&dec, argv[i + 1], W, H, &pic_new) != 0) return 3;
+        double t2 = now();
+        pic_new.i_pts = i;
         x264_nal_t *nals;
         int nn;
-        x264_encoder_encode(e, &nals, &nn, &pi, &po);
-        double t4 = now();
-        tr += t1 - t0; td += t2 - t1; tc += t3 - t2; te += t4 - t3;
+        x264_encoder_encode(e, &nals, &nn, &pic_new, &po);
+        double t3 = now();
+        t_old += t1 - t0; t_new += t2 - t1; t_enc += t3 - t2;
+
+        double my = plane_mse(pic_old.img.plane[0], pic_new.img.plane[0], (size_t)W * H);
+        double mc = (plane_mse(pic_old.img.plane[1], pic_new.img.plane[1], (size_t)W * H / 4) +
+                     plane_mse(pic_old.img.plane[2], pic_new.img.plane[2], (size_t)W * H / 4)) / 2;
+        mse_y += my; mse_c += mc;
+        if (psnr(my) < worst) worst = psnr(my);
     }
-    printf("frames=%d read=%.1fms decode=%.1fms rgb2yuv=%.1fms x264=%.1fms (per frame)\n",
-           n, tr / n * 1e3, td / n * 1e3, tc / n * 1e3, te / n * 1e3);
+    frame_decoder_cleanup(&dec);
+#ifdef HAVE_TURBOJPEG
+    const char *path = "turbojpeg";
+#else
+    const char *path = "stb";
+#endif
+    printf("frames=%d old(stb+rgb2yuv)=%.1fms new(%s)=%.1fms x264=%.1fms per frame; "
+           "new vs old PSNR Y=%.1fdB (worst %.1f) UV=%.1fdB\n",
+           n, t_old / n * 1e3, path, t_new / n * 1e3, t_enc / n * 1e3, psnr(mse_y / n), worst, psnr(mse_c / n));
     return 0;
 }

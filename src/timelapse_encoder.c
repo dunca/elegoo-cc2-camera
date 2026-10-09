@@ -17,8 +17,9 @@
 #include <sys/stat.h>
 #include <pthread.h>
 #include <x264.h>
-
-
+#ifdef HAVE_TURBOJPEG
+#include <turbojpeg.h>
+#endif
 
 // Natural string comparison for filenames (e.g. frame_2.jpg before frame_10.jpg)
 static int natural_sort_cmp(const void *a, const void *b) {
@@ -85,6 +86,100 @@ static int mp4_write_callback(int64_t offset, const void *buffer, size_t size, v
     FILE *f = (FILE *)token;
     if (fseeko(f, offset, SEEK_SET) != 0) return 1;
     return (fwrite(buffer, 1, size, f) == size) ? 0 : 1;
+}
+
+// JPEG stores full-range YCbCr; rgb24_to_yuv420p (and so the encoded video) is limited range.
+// These tables map full range to limited range so both decode paths produce the same video.
+static void init_range_tables(uint8_t y_lut[256], uint8_t c_lut[256]) {
+    for (int i = 0; i < 256; i++) {
+        y_lut[i] = (uint8_t)(16 + (i * 219 + 127) / 255);
+        int c = (i - 128) * 224;
+        c_lut[i] = (uint8_t)(128 + (c >= 0 ? (c + 127) / 255 : -((-c + 127) / 255)));
+    }
+}
+
+static void remap_plane(uint8_t *plane, int stride, int width, int height, const uint8_t lut[256]) {
+    for (int j = 0; j < height; j++) {
+        uint8_t *row = plane + (size_t)j * stride;
+        for (int i = 0; i < width; i++) row[i] = lut[row[i]];
+    }
+}
+
+typedef struct {
+    void *tj; // tjhandle when built with libjpeg-turbo
+    uint8_t y_lut[256];
+    uint8_t c_lut[256];
+} frame_decoder_t;
+
+static void frame_decoder_init(frame_decoder_t *d) {
+    memset(d, 0, sizeof(*d));
+#ifdef HAVE_TURBOJPEG
+    d->tj = tj3Init(TJINIT_DECOMPRESS);
+#endif
+    init_range_tables(d->y_lut, d->c_lut);
+}
+
+static void frame_decoder_cleanup(frame_decoder_t *d) {
+#ifdef HAVE_TURBOJPEG
+    if (d->tj) tj3Destroy(d->tj);
+#endif
+    d->tj = NULL;
+}
+
+// Decode one JPEG frame into the I420 picture. Returns 0 on success, -1 if the frame is unreadable.
+// Fast path (libjpeg-turbo): a 4:2:0 JPEG of the output size decodes straight into the encoder's
+// planes, skipping the RGB round trip. Anything else goes through stb_image + rgb24_to_yuv420p.
+static int load_frame_i420(frame_decoder_t *d, const char *path, int width, int height, x264_picture_t *pic) {
+    int w = 0, h = 0, channels = 0;
+    uint8_t *rgb_data = NULL;
+#ifdef HAVE_TURBOJPEG
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    rewind(f);
+    uint8_t *jpeg = size > 0 ? malloc(size) : NULL;
+    if (!jpeg || fread(jpeg, 1, size, f) != (size_t)size) {
+        free(jpeg);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    if (d->tj && tj3DecompressHeader(d->tj, jpeg, size) == 0 &&
+        tj3Get(d->tj, TJPARAM_JPEGWIDTH) == width && tj3Get(d->tj, TJPARAM_JPEGHEIGHT) == height &&
+        tj3Get(d->tj, TJPARAM_SUBSAMP) == TJSAMP_420 && tj3Get(d->tj, TJPARAM_COLORSPACE) == TJCS_YCbCr) {
+        unsigned char *planes[3] = { pic->img.plane[0], pic->img.plane[1], pic->img.plane[2] };
+        int strides[3] = { pic->img.i_stride[0], pic->img.i_stride[1], pic->img.i_stride[2] };
+        if (tj3DecompressToYUVPlanes8(d->tj, jpeg, size, planes, strides) == 0) {
+            free(jpeg);
+            remap_plane(planes[0], strides[0], width, height, d->y_lut);
+            remap_plane(planes[1], strides[1], width / 2, height / 2, d->c_lut);
+            remap_plane(planes[2], strides[2], width / 2, height / 2, d->c_lut);
+            return 0;
+        }
+    }
+    rgb_data = stbi_load_from_memory(jpeg, (int)size, &w, &h, &channels, 3);
+    free(jpeg);
+#else
+    (void)d;
+    rgb_data = stbi_load(path, &w, &h, &channels, 3);
+#endif
+    if (!rgb_data) return -1;
+
+    if (w == width && h == height) {
+        rgb24_to_yuv420p(rgb_data, width, height, pic->img.plane[0], pic->img.plane[1], pic->img.plane[2]);
+    } else {
+        // If image resolution differs, center/crop into width x height buffer
+        memset(pic->img.plane[0], 0x10, width * height);
+        memset(pic->img.plane[1], 0x80, (width / 2) * (height / 2));
+        memset(pic->img.plane[2], 0x80, (width / 2) * (height / 2));
+        int copy_w = (w < width) ? w : width;
+        int copy_h = (h < height) ? h : height;
+        rgb24_to_yuv420p(rgb_data, copy_w, copy_h, pic->img.plane[0], pic->img.plane[1], pic->img.plane[2]);
+    }
+    stbi_image_free(rgb_data);
+    return 0;
 }
 
 int timelapse_encode_directory(const char *image_dir, const char *output_mp4, int fps, int width, int height,
@@ -230,28 +325,14 @@ int timelapse_encode_directory(const char *image_dir, const char *output_mp4, in
     uint32_t timescale = 90000;
     uint32_t frame_duration_90k = timescale / fps;
 
+    frame_decoder_t decoder;
+    frame_decoder_init(&decoder);
+
     for (size_t i = 0; i < file_count; i++) {
-        int w = 0, h = 0, channels = 0;
-        uint8_t *rgb_data = stbi_load(file_list[i], &w, &h, &channels, 3);
-        if (!rgb_data) {
+        if (load_frame_i420(&decoder, file_list[i], width, height, &pic_in) != 0) {
             fprintf(stderr, "[timelapse] Warning: Skipping unreadable frame '%s'\n", file_list[i]);
             continue;
         }
-
-        if (w == width && h == height) {
-            rgb24_to_yuv420p(rgb_data, width, height,
-                             pic_in.img.plane[0], pic_in.img.plane[1], pic_in.img.plane[2]);
-        } else {
-            // If image resolution differs, center/crop into width x height buffer
-            memset(pic_in.img.plane[0], 0x10, width * height);
-            memset(pic_in.img.plane[1], 0x80, (width / 2) * (height / 2));
-            memset(pic_in.img.plane[2], 0x80, (width / 2) * (height / 2));
-            int copy_w = (w < width) ? w : width;
-            int copy_h = (h < height) ? h : height;
-            rgb24_to_yuv420p(rgb_data, copy_w, copy_h,
-                             pic_in.img.plane[0], pic_in.img.plane[1], pic_in.img.plane[2]);
-        }
-        stbi_image_free(rgb_data);
 
         pic_in.i_pts = i;
 
@@ -279,6 +360,7 @@ int timelapse_encode_directory(const char *image_dir, const char *output_mp4, in
         }
     }
 
+    frame_decoder_cleanup(&decoder);
     x264_picture_clean(&pic_in);
     x264_encoder_close(encoder);
     mp4_h26x_write_close(&mp4_writer);

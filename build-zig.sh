@@ -4,12 +4,13 @@
 # Usage: ./build-zig.sh            -> build/zig-<cpu>/ai_camera (+ stagebench)
 # CC2_CPU selects the zig CPU model (default: cortex_a7 = the CC2's Allwinner R528, ARMv7 + NEON + VFPv4).
 #   CC2_CPU=generic+v7a+vfp3d16-neon reproduces the upstream release target (generic ARMv7, no NEON in C code).
-# Requirements: zig (brew install zig), git, make.
+# Requirements: zig (brew install zig), git, make, cmake.
 set -euo pipefail
 
 CPU="${CC2_CPU:-cortex_a7}"
 TAG="$(printf '%s' "$CPU" | tr -c 'a-zA-Z0-9_\n' '_')"
 X264_COMMIT=0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee
+LIBJPEG_TURBO_TAG=3.1.4.1
 
 # x264's configure breaks on paths with spaces, so work through a space-free symlink.
 REAL_ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -48,11 +49,34 @@ if [[ ! -f "$SYSROOT/lib/libx264.a" ]]; then
     && make -j"$(getconf _NPROCESSORS_ONLN)" > make.log 2>&1 && make install > /dev/null)
 fi
 
+# libjpeg-turbo (TurboJPEG API, NEON SIMD), pinned, static, once per CPU model.
+if [[ ! -d build/libjpeg-turbo-src/.git ]]; then
+  git clone -q https://github.com/libjpeg-turbo/libjpeg-turbo.git build/libjpeg-turbo-src
+fi
+git -C build/libjpeg-turbo-src checkout -q "$LIBJPEG_TURBO_TAG"
+if [[ ! -f "$SYSROOT/lib/libturbojpeg.a" ]]; then
+  cat > "$TC/toolchain.cmake" <<EOF
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR arm)
+set(CMAKE_C_COMPILER $TC/arm-gcc)
+set(CMAKE_ASM_COMPILER $TC/arm-gcc)
+set(CMAKE_AR $TC/arm-ar)
+set(CMAKE_RANLIB $TC/arm-ranlib)
+EOF
+  cmake -S build/libjpeg-turbo-src -B "build/libjpeg-turbo-$TAG" \
+    -DCMAKE_TOOLCHAIN_FILE="$TC/toolchain.cmake" -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$SYSROOT" -DENABLE_SHARED=OFF -DENABLE_STATIC=ON \
+    -DWITH_TURBOJPEG=ON -DWITH_JAVA=OFF -DWITH_TOOLS=OFF -DWITH_TESTS=OFF -DWITH_SIMD=ON \
+    -DREQUIRE_SIMD=ON > "build/libjpeg-turbo-$TAG.configure.log"
+  cmake --build "build/libjpeg-turbo-$TAG" -j"$(getconf _NPROCESSORS_ONLN)" > "build/libjpeg-turbo-$TAG.make.log"
+  cmake --install "build/libjpeg-turbo-$TAG" > /dev/null
+fi
+
 VERSION="$(sed -n 's/^VERSION ?= //p' Makefile)"
 GIT_VER="$(git describe --tags --always --dirty 2>/dev/null || echo "v$VERSION")"
 CFLAGS=(-O3 -Isrc -D_GNU_SOURCE "-DAPP_VERSION=\"$VERSION\"" "-DGIT_VERSION=\"$GIT_VER\""
-        -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DQS=0 "-I$SYSROOT/include" -w)
-LDFLAGS=("-L$SYSROOT/lib" -static -s -pthread -lx264 -lm)
+        -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DQS=0 -DHAVE_TURBOJPEG "-I$SYSROOT/include" -w)
+LDFLAGS=("-L$SYSROOT/lib" -static -s -pthread -lx264 -lturbojpeg -lm)
 
 OBJS=()
 for src in main frame_ring v4l2_camera http_server uds_ipc timelapse_encoder db_sync sqlite3; do
