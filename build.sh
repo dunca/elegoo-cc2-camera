@@ -54,7 +54,8 @@ else
   printf '#!/bin/sh\nexec %s "$@"\n' "$MC/bin/armv7l-linux-musleabihf-ar" > "$TC/arm-ar"
   printf '#!/bin/sh\nexec %s "$@"\n' "$MC/bin/armv7l-linux-musleabihf-ranlib" > "$TC/arm-ranlib"
   # Passing a CPU flag stops x264's configure from adding its own -mcpu=cortex-a8.
-  X264_CPU_FLAGS="${CPU:--march=armv7-a}"
+  # vfpv3-d16 is the toolchain default; spelling it out only keeps x264 from picking cortex-a8.
+  X264_CPU_FLAGS="${CPU:--mfpu=vfpv3-d16}"
 fi
 printf '#!/bin/sh\nexit 0\n' > "$TC/arm-strip"
 printf '#!/bin/sh\nexec strings -a "$@"\n' > "$TC/arm-strings"
