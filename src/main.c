@@ -51,6 +51,9 @@ static void print_usage(const char *prog_name) {
 }
 
 int main(int argc, char **argv) {
+    // Line-buffer stdout so log lines appear immediately when redirected to a file.
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     char device_path[64] = "/dev/video0";
     int width = 1280;
     int height = 720;
