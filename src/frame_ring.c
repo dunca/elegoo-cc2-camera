@@ -126,8 +126,14 @@ void frame_ring_stats(frame_ring_t *ring, uint64_t *total_frames, uint64_t *last
     int latest_idx = (ring->write_index - 1 + MAX_RING_BUFFERS) % MAX_RING_BUFFERS;
     *total_frames = ring->total_frames;
     *last_frame_us = ring->total_frames ? ring->frames[latest_idx].timestamp_us : 0;
+    // Before the first full 2 s window, report the rate of the partial one.
+    double fps = ring->fps_measured;
+    if (fps == 0.0 && ring->rate_window_frames > 0 && ring->total_frames) {
+        uint64_t span = ring->frames[latest_idx].timestamp_us - ring->rate_window_start_us;
+        if (span > 0) fps = (double)ring->rate_window_frames * 1e6 / (double)span;
+    }
     // A stalled camera stops calling push, so age the measured rate out here.
     *fps_measured = (ring->total_frames && monotonic_us() - ring->frames[latest_idx].timestamp_us < 3000000ULL)
-                    ? ring->fps_measured : 0.0;
+                    ? fps : 0.0;
     pthread_mutex_unlock(&ring->lock);
 }
