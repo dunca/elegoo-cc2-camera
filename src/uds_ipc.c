@@ -202,6 +202,7 @@ static void process_ipc_message(uds_ipc_t *ipc, int client_fd, const char *msg) 
         printf("[uds_ipc] Received IPC message: method='%s', status='%s', mode='%s', filename='%s', index='%s', id='%s'\n",
                method, status_param[0] ? status_param : "none", mode[0] ? mode : "none",
                filename[0] ? filename : "none", index_str[0] ? index_str : "none", id[0] ? id : "null");
+        if (getenv("AICAM_LOG_RAW")) printf("[uds_ipc]   raw: %.600s\n", msg);
     }
 
     char status_str[64] = "ok";

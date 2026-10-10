@@ -68,6 +68,24 @@ int main(int argc, char **argv) {
     char output_mp4[256] = "/opt/usr/video/timelapse.mp4";
     uint32_t format = V4L2_PIX_FMT_MJPEG;
 
+    // Persisted camera-quality preference, set on the printer by `camq` (survives reboots).
+    // One token per line: "720" / "1280x720" / "360" / "640x360". CLI -w/-h still override.
+    FILE *qf = fopen("/opt/usr/camera-quality", "r");
+    if (qf) {
+        char line[64] = {0};
+        if (fgets(line, sizeof(line), qf)) {
+            int cw = 0, ch = 0;
+            if (sscanf(line, "%dx%d", &cw, &ch) == 2 && cw > 0 && ch > 0) {
+                width = cw; height = ch;
+            } else if (sscanf(line, "%d", &cw) == 1) {
+                if (cw == 360) { width = 640; height = 360; }
+                else if (cw == 720) { width = 1280; height = 720; }
+                else if (cw == 1080) { width = 1920; height = 1080; }
+            }
+        }
+        fclose(qf);
+    }
+
     static struct option long_options[] = {
         {"device", required_argument, 0, 'd'},
         {"width", required_argument, 0, 'w'},
