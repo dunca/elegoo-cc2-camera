@@ -22,11 +22,14 @@
 #endif
 
 static volatile int keep_running = 1;
+static volatile sig_atomic_t reload_requested = 0;
 
 static void sig_handler(int signo) {
     if (signo == SIGINT || signo == SIGTERM) {
         printf("\n[main] Signal %d received, shutting down...\n", signo);
         keep_running = 0;
+    } else if (signo == SIGHUP) {
+        reload_requested = 1; // handled by the main loop: re-read /opt/usr/camera-quality
     }
 }
 
@@ -35,6 +38,8 @@ static void sig_handler(int signo) {
 // Log file kept in RAM (/tmp); rotated to <path>.1 once it passes this size.
 #define LOG_MAX_BYTES (256 * 1024)
 #define DEFAULT_LOG_PATH "/tmp/ai_camera.log"
+// Persisted resolution / fps preference; re-read on SIGHUP (see camq).
+#define CAMERA_QUALITY_PATH "/opt/usr/camera-quality"
 
 static char log_path[128] = DEFAULT_LOG_PATH;
 
@@ -156,7 +161,7 @@ int main(int argc, char **argv) {
     char output_mp4[256] = "/opt/usr/video/timelapse.mp4";
     uint32_t format = V4L2_PIX_FMT_MJPEG;
 
-    read_camera_quality("/opt/usr/camera-quality", &width, &height, &fps);
+    read_camera_quality(CAMERA_QUALITY_PATH, &width, &height, &fps);
 
     static struct option long_options[] = {
         {"device", required_argument, 0, 'd'},
@@ -232,6 +237,7 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+    signal(SIGHUP, sig_handler);
     signal(SIGPIPE, SIG_IGN);
 
     frame_ring_t ring;
@@ -308,7 +314,15 @@ int main(int argc, char **argv) {
 
     unsigned ticks = 0;
     while (keep_running) {
-        sleep(1);
+        sleep(1); // returns early when a signal arrives
+        if (reload_requested) {
+            reload_requested = 0;
+            // Same defaults as at startup; the file decides (camq writes it before signalling).
+            int new_w = 1280, new_h = 720, new_fps = 0;
+            read_camera_quality(CAMERA_QUALITY_PATH, &new_w, &new_h, &new_fps);
+            printf("[main] SIGHUP: camera-quality reload -> %dx%d, fps cap %d\n", new_w, new_h, new_fps);
+            v4l2_camera_reconfigure(&camera, new_w, new_h, new_fps);
+        }
         if (log_to_file && ++ticks % 10 == 0) log_rotate_if_needed();
     }
 

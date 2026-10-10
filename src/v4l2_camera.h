@@ -13,7 +13,7 @@ typedef struct {
     int req_height;
     int width;          // negotiated with the driver on the last successful open
     int height;
-    int fps;            // output frame-rate cap applied in software; 0 = whatever the camera delivers
+    volatile int fps;   // output frame-rate cap applied in software; 0 = whatever the camera delivers
     int quality;
     uint32_t req_pixelformat;
     uint32_t pixelformat; // V4L2_PIX_FMT_MJPEG or V4L2_PIX_FMT_H264
@@ -32,6 +32,7 @@ typedef struct {
     volatile int streaming;      // 1 while the device is open and streaming
     volatile unsigned reopens;   // times capture was torn down and reopened after a fault
     volatile int open_failures;  // consecutive failed open attempts
+    volatile int reconfigure;    // set by v4l2_camera_reconfigure: reopen with the new requested size
 } v4l2_camera_t;
 
 // Opens the device and starts streaming. On failure the struct is still usable:
@@ -39,6 +40,9 @@ typedef struct {
 int v4l2_camera_init(v4l2_camera_t *cam, const char *dev_path, int width, int height, int fps, int quality, uint32_t fmt, frame_ring_t *ring);
 int v4l2_camera_start(v4l2_camera_t *cam);
 void v4l2_camera_stop(v4l2_camera_t *cam);
+// Applies new settings to the running capture: the fps cap from the next frame on; a new size by
+// reopening the device inside the capture thread (stream clients stay connected).
+void v4l2_camera_reconfigure(v4l2_camera_t *cam, int width, int height, int fps);
 void v4l2_camera_cleanup(v4l2_camera_t *cam);
 
 #endif // V4L2_CAMERA_H

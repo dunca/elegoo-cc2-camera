@@ -82,6 +82,50 @@ static void rgb24_to_yuv420p(const uint8_t *rgb, int width, int height,
     }
 }
 
+// Bilinear scale of an RGB24 image into a dst_w x dst_h canvas, aspect ratio kept, centred on black.
+static void scale_rgb_fit(const uint8_t *src, int src_w, int src_h, uint8_t *dst, int dst_w, int dst_h) {
+    memset(dst, 0, (size_t)dst_w * dst_h * 3);
+    if (src_w <= 0 || src_h <= 0) return;
+
+    int out_w = dst_w, out_h = dst_h;
+    if ((int64_t)src_w * dst_h > (int64_t)src_h * dst_w) {
+        out_h = (int)((int64_t)src_h * dst_w / src_w);
+    } else {
+        out_w = (int)((int64_t)src_w * dst_h / src_h);
+    }
+    if (out_w < 1) out_w = 1;
+    if (out_h < 1) out_h = 1;
+    int off_x = (dst_w - out_w) / 2;
+    int off_y = (dst_h - out_h) / 2;
+
+    // 16.16 fixed-point source coordinates of each output pixel centre
+    for (int y = 0; y < out_h; y++) {
+        int64_t sy = (((int64_t)y * 2 + 1) * src_h * 65536) / ((int64_t)out_h * 2) - 32768;
+        if (sy < 0) sy = 0;
+        int y0 = (int)(sy >> 16);
+        int fy = (int)(sy & 0xFFFF);
+        if (y0 >= src_h - 1) { y0 = src_h - 1; fy = 0; }
+        int y1 = (y0 + 1 < src_h) ? y0 + 1 : y0;
+        const uint8_t *r0 = src + (size_t)y0 * src_w * 3;
+        const uint8_t *r1 = src + (size_t)y1 * src_w * 3;
+        uint8_t *out = dst + ((size_t)(y + off_y) * dst_w + off_x) * 3;
+        for (int x = 0; x < out_w; x++) {
+            int64_t sx = (((int64_t)x * 2 + 1) * src_w * 65536) / ((int64_t)out_w * 2) - 32768;
+            if (sx < 0) sx = 0;
+            int x0 = (int)(sx >> 16);
+            int fx = (int)(sx & 0xFFFF);
+            if (x0 >= src_w - 1) { x0 = src_w - 1; fx = 0; }
+            int x1 = (x0 + 1 < src_w) ? x0 + 1 : x0;
+            for (int c = 0; c < 3; c++) {
+                int64_t top = (int64_t)r0[x0 * 3 + c] * (65536 - fx) + (int64_t)r0[x1 * 3 + c] * fx;
+                int64_t bot = (int64_t)r1[x0 * 3 + c] * (65536 - fx) + (int64_t)r1[x1 * 3 + c] * fx;
+                int64_t v = (top * (65536 - fy) + bot * fy + ((int64_t)1 << 31)) >> 32;
+                out[x * 3 + c] = (uint8_t)(v > 255 ? 255 : v);
+            }
+        }
+    }
+}
+
 // MinimP4 file write callback (return 0 on success, non-zero on error)
 static int mp4_write_callback(int64_t offset, const void *buffer, size_t size, void *token) {
     FILE *f = (FILE *)token;
@@ -171,13 +215,16 @@ static int load_frame_i420(frame_decoder_t *d, const char *path, int width, int 
     if (w == width && h == height) {
         rgb24_to_yuv420p(rgb_data, width, height, pic->img.plane[0], pic->img.plane[1], pic->img.plane[2]);
     } else {
-        // If image resolution differs, center/crop into width x height buffer
-        memset(pic->img.plane[0], 0x10, width * height);
-        memset(pic->img.plane[1], 0x80, (width / 2) * (height / 2));
-        memset(pic->img.plane[2], 0x80, (width / 2) * (height / 2));
-        int copy_w = (w < width) ? w : width;
-        int copy_h = (h < height) ? h : height;
-        rgb24_to_yuv420p(rgb_data, copy_w, copy_h, pic->img.plane[0], pic->img.plane[1], pic->img.plane[2]);
+        // A frame of another size (camera resolution changed mid-print): scale it to fit the video,
+        // keeping its aspect ratio, black bars if that differs.
+        uint8_t *fitted = malloc((size_t)width * height * 3);
+        if (!fitted) {
+            stbi_image_free(rgb_data);
+            return -1;
+        }
+        scale_rgb_fit(rgb_data, w, h, fitted, width, height);
+        rgb24_to_yuv420p(fitted, width, height, pic->img.plane[0], pic->img.plane[1], pic->img.plane[2]);
+        free(fitted);
     }
     stbi_image_free(rgb_data);
     return 0;
@@ -299,6 +346,38 @@ int timelapse_encode_directory(const char *image_dir, const char *output_mp4, in
         }
         width = img_w;
         height = img_h;
+
+        // If the resolution was changed during the print the first and last frames differ;
+        // then use the size most frames have, so most frames take the fast decode path.
+        int last_w = 0, last_h = 0;
+        if (file_count > 1 && stbi_info(file_list[file_count - 1], &last_w, &last_h, &img_comp) &&
+            (last_w != width || last_h != height)) {
+            int sizes_w[8], sizes_h[8];
+            size_t counts[8];
+            int n_sizes = 0;
+            for (size_t i = 0; i < file_count; i++) {
+                int fw = 0, fh = 0, fc = 0;
+                if (!stbi_info(file_list[i], &fw, &fh, &fc)) continue;
+                int k = 0;
+                while (k < n_sizes && (sizes_w[k] != fw || sizes_h[k] != fh)) k++;
+                if (k == n_sizes) {
+                    if (n_sizes == 8) continue;
+                    sizes_w[k] = fw;
+                    sizes_h[k] = fh;
+                    counts[k] = 0;
+                    n_sizes++;
+                }
+                counts[k]++;
+            }
+            int best = 0;
+            for (int k = 1; k < n_sizes; k++) if (counts[k] > counts[best]) best = k;
+            if (n_sizes > 0) {
+                width = sizes_w[best];
+                height = sizes_h[best];
+            }
+            printf("[timelapse] Frames have %d different sizes; encoding at %dx%d, others are scaled\n",
+                   n_sizes, width, height);
+        }
     }
 
     // Width and height must be even for YUV420P

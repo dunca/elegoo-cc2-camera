@@ -193,11 +193,14 @@ static void sleep_while_running(v4l2_camera_t *cam, int ms) {
 static void *camera_thread_proc(void *arg) {
     v4l2_camera_t *cam = (v4l2_camera_t *)arg;
     int backoff_ms = 1000;
-    uint64_t interval_us = cam->fps > 0 ? 1000000ULL / (uint64_t)cam->fps : 0;
+    int cap_fps = cam->fps;
+    uint64_t interval_us = cap_fps > 0 ? 1000000ULL / (uint64_t)cap_fps : 0;
     uint64_t next_due_us = 0;
 
     while (cam->running) {
         if (cam->fd < 0) {
+            cam->reconfigure = 0; // a closed device opens with the current requested size anyway
+            __sync_synchronize();
             // Log the first failure of a run and then every ~5 minutes.
             int verbose = cam->open_failures == 0 || cam->open_failures % 30 == 0;
             if (cam_open(cam, verbose) != 0) {
@@ -220,7 +223,12 @@ static void *camera_thread_proc(void *arg) {
         const char *fault = NULL;
         uint64_t last_frame_us = monotonic_us();
 
+        int reconfigure = 0;
         while (cam->running && !fault) {
+            if (cam->reconfigure) {
+                reconfigure = 1;
+                break;
+            }
             int r = poll(fds, 1, 1000); // 1 sec timeout
             if (r < 0) {
                 if (errno == EINTR) continue;
@@ -251,6 +259,11 @@ static void *camera_thread_proc(void *arg) {
 
             uint64_t now = monotonic_us();
             last_frame_us = now;
+            if (cam->fps != cap_fps) {
+                cap_fps = cam->fps;
+                interval_us = cap_fps > 0 ? 1000000ULL / (uint64_t)cap_fps : 0;
+                next_due_us = 0;
+            }
             if (buf.index < cam->n_buffers && buf.bytesused > 0) {
                 int keep = 1;
                 if (interval_us) {
@@ -269,6 +282,12 @@ static void *camera_thread_proc(void *arg) {
                 fault = "requeue failed";
                 break;
             }
+        }
+
+        if (reconfigure && cam->running) {
+            printf("[v4l2_camera] Reopening %s at %dx%d\n", cam->device_path, cam->req_width, cam->req_height);
+            cam_close(cam);
+            continue;
         }
 
         if (fault && cam->running) {
@@ -317,6 +336,16 @@ int v4l2_camera_start(v4l2_camera_t *cam) {
         return -1;
     }
     return 0;
+}
+
+void v4l2_camera_reconfigure(v4l2_camera_t *cam, int width, int height, int fps) {
+    cam->fps = fps > 0 ? fps : 0;
+    if (width > 0 && height > 0 && (width != cam->req_width || height != cam->req_height)) {
+        cam->req_width = width;
+        cam->req_height = height;
+        __sync_synchronize(); // the capture thread must see the new size before the flag
+        cam->reconfigure = 1;
+    }
 }
 
 void v4l2_camera_stop(v4l2_camera_t *cam) {
