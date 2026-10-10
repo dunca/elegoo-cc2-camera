@@ -30,6 +30,8 @@ The output matches the original path (56.6 dB PSNR on the YUV input).
 
 **Printer scripts** are in [`printer/`](printer/): `camq` (set resolution and fps), an SSH forced-command wrapper for home automation, and `camwatch.sh` (restarts the service if it dies or hangs).
 
+**Getting into the printer** (SSH, and recovering from a bootloop over UART + FEL): see [dunca/elegoo-cc2-recovery](https://github.com/dunca/elegoo-cc2-recovery).
+
 ### Build
 
 ```
