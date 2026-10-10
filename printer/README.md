@@ -1,6 +1,6 @@
 # Printer-side scripts for the fork
 
-Installed in `/opt/usr` on the printer (UDISK, kept across firmware updates).
+Built into the custom firmware as `/usr/bin/camq`, `/usr/bin/camq-ha.sh` and `/usr/bin/camwatch.sh`, with `camwatch.sh` started from `/etc/rc.local`. They also work from `/opt/usr`. The setting itself lives in `/opt/usr/camera-quality` (UDISK), so it survives firmware updates.
 
 | Script | What it does |
 | --- | --- |
