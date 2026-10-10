@@ -1,0 +1,65 @@
+#!/bin/sh
+# camq: set the CC2 camera resolution and frame-rate cap for our ai_camera fork.
+# Writes /opt/usr/camera-quality (survives reboots) as <resolution>[@<fps>], then tells the running
+# camera to reload it (SIGHUP): the fps cap applies from the next frame, a new resolution reopens the
+# camera inside the process (~0.5 s, viewers stay connected). Builds without reload support are
+# restarted instead (~5 s; Elegoo's printer and screen apps reconnect on their own).
+#
+#   camq              show the setting and what the running camera reports
+#   camq 720          1280x720  (default/high), keeps the current fps cap
+#   camq 360          640x360   (low: smaller timelapses, lighter encode)
+#   camq 1080         1920x1080 (if the camera supports it)
+#   camq WxH          any explicit size
+#   camq 720@15       resolution and fps cap together
+#   camq fps 15       fps cap only (1-30), keeps the resolution
+#   camq fps 0        remove the cap (camera's own rate, normally 30)
+Q=/opt/usr/camera-quality
+
+cur=$(cat "$Q" 2>/dev/null)
+cur_res=${cur%%@*}
+[ -n "$cur_res" ] || cur_res=720
+case "$cur" in *@*) cur_fps=${cur#*@} ;; *) cur_fps=0 ;; esac
+
+valid_res() { case "$1" in 360|720|1080) return 0 ;; *[!0-9x]*|x*|*x) return 1 ;; [0-9]*x[0-9]*) return 0 ;; *) return 1 ;; esac; }
+valid_fps() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -le 30 ]; }
+usage() { echo "usage: camq [360|720|1080|WxH][@fps] | camq fps <0-30>"; exit 1; }
+
+if [ -z "$1" ]; then
+    echo "camera-quality: ${cur:-(unset: 720, no fps cap)}"
+    echo "ai_camera pid: $(pidof ai_camera || echo none)"
+    wget -q -O - http://127.0.0.1:8080/health 2>/dev/null || echo "(no /health answer)"
+    exit 0
+fi
+
+if [ "$1" = "fps" ]; then
+    valid_fps "$2" || usage
+    res=$cur_res
+    fps=$2
+else
+    res=${1%%@*}
+    valid_res "$res" || usage
+    case "$1" in
+        *@*) fps=${1#*@}; valid_fps "$fps" || usage ;;
+        *) fps=$cur_fps ;;
+    esac
+fi
+
+if [ "$fps" -gt 0 ]; then echo "$res@$fps" > "$Q"; else echo "$res" > "$Q"; fi
+sync
+echo "set camera-quality = $(cat "$Q")"
+
+pid=$(pidof ai_camera)
+if [ -n "$pid" ] && grep -q "camera-quality reload" /opt/bin/ai_camera 2> /dev/null; then
+    kill -HUP "$pid"
+    sleep 2
+    echo "ai_camera reloaded, pid $(pidof ai_camera || echo GONE)"
+    exit 0
+fi
+
+# Restart the camera (full path + start-stop-daemon: the SSH PATH lacks /opt/bin).
+killall ai_camera 2>/dev/null
+sleep 2
+cd /
+start-stop-daemon -S -b -x /opt/bin/ai_camera
+sleep 3
+echo "ai_camera restarted, pid $(pidof ai_camera || echo FAILED)"
