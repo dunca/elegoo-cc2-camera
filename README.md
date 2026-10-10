@@ -1,3 +1,48 @@
+# ai_camera (cc2-opt fork)
+
+This is a fork of [viridivn/ai_camera](https://github.com/viridivn/ai_camera) v0.2.3 for the Elegoo Centauri Carbon 2. The `cc2-opt` branch adds the following; the original README follows below.
+
+**Faster timelapse encoding.** 150 frames at 720p, measured on the printer:
+
+| Change | Encode time | Peak memory |
+| --- | --- | --- |
+| v0.2.3 release | 44.8 s | 17.8 MB |
+| Built for Cortex-A7 + NEON | 38.1 s | 18.0 MB |
+| stb_image NEON paths | 37.3 s | 18.0 MB |
+| libjpeg-turbo decodes JPEG straight to YUV (no RGB round trip) | 20.7 s | 14.6 MB |
+| Decode the next frame on the second core while x264 encodes | 17.0 s | 15.9 MB |
+
+The output matches the original path (56.6 dB PSNR on the YUV input).
+
+**Reliability.**
+- After a read error, an unplug or 5 s without frames, the capture thread reopens the camera, and viewers stay connected.
+- The service also starts without a camera and waits for one.
+- At most 8 stream viewers; stalled clients are dropped after 10 s.
+- Waits use a monotonic clock, so the boot-time clock jump does not affect them.
+
+**Settings and endpoints.**
+- `/opt/usr/camera-quality` holds `<resolution>[@<fps>]`, e.g. `720`, `360@10`. It is read at start and applied live on `SIGHUP`: a new frame-rate cap takes effect on the next frame; a new resolution reopens the camera inside the process.
+- `GET /snapshot` returns one JPEG, or 503 when there is no recent frame.
+- `GET /health` returns JSON: resolution, fps cap, measured fps, age of the last frame, reopen count, viewers, uptime.
+- The log goes to `/tmp/ai_camera.log` and is rotated at 256 KB.
+
+**Timelapse frames of mixed sizes**, after a resolution change mid-print, are scaled to fit. Before, they were cropped with the wrong stride.
+
+**Printer scripts** are in [`printer/`](printer/): `camq` (set resolution and fps), an SSH forced-command wrapper for home automation, and `camwatch.sh` (restarts the service if it dies or hangs).
+
+### Build
+
+```
+./build.sh                     # zig cc (macOS or Linux): build/zig-cortex_a7/ai_camera
+CC2_TOOLCHAIN=gcc ./build.sh   # musl.cc gcc, x86_64 Linux only
+```
+
+`build.sh` fetches and builds pinned x264 and libjpeg-turbo, and links everything statically. `tools/bench.sh` compares two builds on the printer without touching the running service.
+
+Licence: AGPLv3, as upstream.
+
+---
+
 # ai_camera
 
 A lightweight replacement for the stock ai_camera service on the Elegoo Centauri Carbon 2. Supports higher resolution streaming, timelapses and auto-encoding while (hopefully) being less prone to crashing.
