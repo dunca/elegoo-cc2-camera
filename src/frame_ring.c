@@ -2,13 +2,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
+#include <time.h>
 #include <errno.h>
+
+uint64_t monotonic_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
 
 int frame_ring_init(frame_ring_t *ring) {
     memset(ring, 0, sizeof(*ring));
     if (pthread_mutex_init(&ring->lock, NULL) != 0) return -1;
-    if (pthread_cond_init(&ring->cond, NULL) != 0) {
+    pthread_condattr_t cattr;
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+    int cr = pthread_cond_init(&ring->cond, &cattr);
+    pthread_condattr_destroy(&cattr);
+    if (cr != 0) {
         pthread_mutex_destroy(&ring->lock);
         return -1;
     }
@@ -51,9 +62,22 @@ void frame_ring_push(frame_ring_t *ring, const uint8_t *data, size_t size) {
     ring->total_frames++;
     ring->frames[idx].sequence = ring->total_frames;
 
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    ring->frames[idx].timestamp_us = (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+    uint64_t now = monotonic_us();
+    ring->frames[idx].timestamp_us = now;
+
+    // Restart the window after a stall so the gap does not drag the next reading down.
+    if (ring->rate_window_start_us == 0 || now - ring->rate_window_start_us > 6000000ULL) {
+        ring->rate_window_start_us = now;
+        ring->rate_window_frames = 0;
+    } else {
+        ring->rate_window_frames++;
+        uint64_t span = now - ring->rate_window_start_us;
+        if (span >= 2000000ULL) {
+            ring->fps_measured = (double)ring->rate_window_frames * 1e6 / (double)span;
+            ring->rate_window_start_us = now;
+            ring->rate_window_frames = 0;
+        }
+    }
 
     ring->write_index = (ring->write_index + 1) % MAX_RING_BUFFERS;
     pthread_cond_broadcast(&ring->cond);
@@ -64,10 +88,9 @@ int frame_ring_get_latest(frame_ring_t *ring, uint64_t last_seq, uint8_t *out_bu
     pthread_mutex_lock(&ring->lock);
 
     struct timespec ts;
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    ts.tv_sec = tv.tv_sec + timeout_ms / 1000;
-    ts.tv_nsec = (tv.tv_usec + (timeout_ms % 1000) * 1000) * 1000;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
     if (ts.tv_nsec >= 1000000000) {
         ts.tv_sec += 1;
         ts.tv_nsec -= 1000000000;
@@ -96,4 +119,15 @@ int frame_ring_get_latest(frame_ring_t *ring, uint64_t last_seq, uint8_t *out_bu
 
     pthread_mutex_unlock(&ring->lock);
     return 0;
+}
+
+void frame_ring_stats(frame_ring_t *ring, uint64_t *total_frames, uint64_t *last_frame_us, double *fps_measured) {
+    pthread_mutex_lock(&ring->lock);
+    int latest_idx = (ring->write_index - 1 + MAX_RING_BUFFERS) % MAX_RING_BUFFERS;
+    *total_frames = ring->total_frames;
+    *last_frame_us = ring->total_frames ? ring->frames[latest_idx].timestamp_us : 0;
+    // A stalled camera stops calling push, so age the measured rate out here.
+    *fps_measured = (ring->total_frames && monotonic_us() - ring->frames[latest_idx].timestamp_us < 3000000ULL)
+                    ? ring->fps_measured : 0.0;
+    pthread_mutex_unlock(&ring->lock);
 }

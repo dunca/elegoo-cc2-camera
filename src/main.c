@@ -4,6 +4,9 @@
 #include <unistd.h>
 #include <signal.h>
 #include <getopt.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <linux/videodev2.h>
 #include "frame_ring.h"
 #include "v4l2_camera.h"
@@ -29,6 +32,90 @@ static void sig_handler(int signo) {
 
 #include "timelapse_encoder.h"
 
+// Log file kept in RAM (/tmp); rotated to <path>.1 once it passes this size.
+#define LOG_MAX_BYTES (256 * 1024)
+#define DEFAULT_LOG_PATH "/tmp/ai_camera.log"
+
+static char log_path[128] = DEFAULT_LOG_PATH;
+
+// Points stdout and stderr at the log file (append). Returns 0 on success.
+static int log_open(void) {
+    int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return -1;
+    fflush(stdout);
+    fflush(stderr);
+    dup2(fd, STDOUT_FILENO);
+    dup2(fd, STDERR_FILENO);
+    if (fd > STDERR_FILENO) close(fd);
+    return 0;
+}
+
+static void log_rotate_if_needed(void) {
+    struct stat st;
+    if (fstat(STDOUT_FILENO, &st) != 0 || st.st_size < LOG_MAX_BYTES) return;
+    char old_path[sizeof(log_path) + 2];
+    snprintf(old_path, sizeof(old_path), "%s.1", log_path);
+    fflush(stdout);
+    fflush(stderr);
+    rename(log_path, old_path);
+    log_open();
+}
+
+// Persisted preference written by `camq` on the printer (survives reboots), one line:
+//   <resolution>[@<fps>]   resolution = 360 | 720 | 1080 | WxH, e.g. "720", "720@15", "640x360@10"
+//   @<fps>                 frame-rate cap only, default resolution
+static void read_camera_quality(const char *path, int *width, int *height, int *fps) {
+    FILE *qf = fopen(path, "r");
+    if (!qf) return;
+    char line[64] = {0};
+    if (fgets(line, sizeof(line), qf)) {
+        char *at = strchr(line, '@');
+        if (at) {
+            int f = atoi(at + 1);
+            if (f >= 1 && f <= 60) *fps = f;
+            *at = '\0';
+        }
+        int cw = 0, ch = 0;
+        if (sscanf(line, "%dx%d", &cw, &ch) == 2 && cw > 0 && ch > 0) {
+            *width = cw; *height = ch;
+        } else if (sscanf(line, "%d", &cw) == 1) {
+            if (cw == 360) { *width = 640; *height = 360; }
+            else if (cw == 720) { *width = 1280; *height = 720; }
+            else if (cw == 1080) { *width = 1920; *height = 1080; }
+        }
+    }
+    fclose(qf);
+}
+
+typedef struct {
+    v4l2_camera_t *camera;
+    frame_ring_t *ring;
+    http_server_t *http;
+    uint64_t start_us;
+} health_ctx_t;
+
+static int health_json(char *buf, size_t len, void *user) {
+    health_ctx_t *h = user;
+    uint64_t total, last_us;
+    double fps;
+    frame_ring_stats(h->ring, &total, &last_us, &fps);
+    uint64_t now = monotonic_us();
+    long long age_ms = total ? (long long)((now - last_us) / 1000ULL) : -1;
+    int streaming = h->camera->streaming;
+    int ok = streaming && total && age_ms < 5000;
+    char fourcc[5] = {0};
+    memcpy(fourcc, &h->camera->pixelformat, 4);
+    return snprintf(buf, len,
+        "{\"ok\":%s,\"version\":\"%s\",\"device\":\"%s\",\"streaming\":%s,"
+        "\"width\":%d,\"height\":%d,\"format\":\"%s\",\"fps_cap\":%d,\"fps\":%.1f,"
+        "\"frames\":%llu,\"last_frame_age_ms\":%lld,\"camera_reopens\":%u,\"open_failures\":%d,"
+        "\"stream_clients\":%d,\"uptime_s\":%llu}\n",
+        ok ? "true" : "false", GIT_VERSION, h->camera->device_path, streaming ? "true" : "false",
+        h->camera->width, h->camera->height, fourcc, h->camera->fps, fps,
+        (unsigned long long)total, age_ms, h->camera->reopens, h->camera->open_failures,
+        h->http->stream_clients, (unsigned long long)((now - h->start_us) / 1000000ULL));
+}
+
 static void print_usage(const char *prog_name) {
     printf("ai_camera %s (%s) - lightweight camera & timelapse service\n\n", APP_VERSION, GIT_VERSION);
     printf("Usage: %s [options]\n", prog_name);
@@ -36,10 +123,11 @@ static void print_usage(const char *prog_name) {
     printf("  -d, --device PATH          V4L2 camera device path (default: /dev/video0)\n");
     printf("  -w, --width INT            Capture width (default: 1280)\n");
     printf("  -h, --height INT           Capture height (default: 720)\n");
-    printf("  -r, --fps INT              Target capture / timelapse framerate (e.g. 15, 30)\n");
+    printf("  -r, --fps INT              Cap the stream frame rate (default: camera rate; also settable via camq)\n");
     printf("  -q, --quality INT          JPEG compression quality 1-100\n");
     printf("  -p, --port INT             HTTP stream port (default: 8080)\n");
     printf("  -s, --socket PATH          UDS IPC socket path (default: /tmp/aicamera_uds)\n");
+    printf("  -l, --log PATH             Service log file, rotated at 256 KB (default: %s; '-' = stdout)\n", DEFAULT_LOG_PATH);
     printf("  -f, --format STR           Format: H264 or MJPEG (default: MJPEG)\n");
     printf("      --no-auto-composite    Disable automatic background MP4 encoding on print stop\n");
     printf("      --cleanup              Encode uncompressed timelapses, sync database records, and exit\n");
@@ -68,23 +156,7 @@ int main(int argc, char **argv) {
     char output_mp4[256] = "/opt/usr/video/timelapse.mp4";
     uint32_t format = V4L2_PIX_FMT_MJPEG;
 
-    // Persisted camera-quality preference, set on the printer by `camq` (survives reboots).
-    // One token per line: "720" / "1280x720" / "360" / "640x360". CLI -w/-h still override.
-    FILE *qf = fopen("/opt/usr/camera-quality", "r");
-    if (qf) {
-        char line[64] = {0};
-        if (fgets(line, sizeof(line), qf)) {
-            int cw = 0, ch = 0;
-            if (sscanf(line, "%dx%d", &cw, &ch) == 2 && cw > 0 && ch > 0) {
-                width = cw; height = ch;
-            } else if (sscanf(line, "%d", &cw) == 1) {
-                if (cw == 360) { width = 640; height = 360; }
-                else if (cw == 720) { width = 1280; height = 720; }
-                else if (cw == 1080) { width = 1920; height = 1080; }
-            }
-        }
-        fclose(qf);
-    }
+    read_camera_quality("/opt/usr/camera-quality", &width, &height, &fps);
 
     static struct option long_options[] = {
         {"device", required_argument, 0, 'd'},
@@ -94,6 +166,7 @@ int main(int argc, char **argv) {
         {"quality", required_argument, 0, 'q'},
         {"port", required_argument, 0, 'p'},
         {"socket", required_argument, 0, 's'},
+        {"log", required_argument, 0, 'l'},
         {"format", required_argument, 0, 'f'},
         {"no-auto-composite", no_argument, 0, 1001},
         {"cleanup", no_argument, 0, 1002},
@@ -106,7 +179,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:w:h:r:q:p:s:f:S:E:o:v?", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:h:r:q:p:s:l:f:S:E:o:v?", long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': snprintf(device_path, sizeof(device_path), "%s", optarg); break;
             case 'w': width = atoi(optarg); break;
@@ -115,6 +188,7 @@ int main(int argc, char **argv) {
             case 'q': quality = atoi(optarg); break;
             case 'p': http_port = atoi(optarg); break;
             case 's': snprintf(socket_path, sizeof(socket_path), "%s", optarg); break;
+            case 'l': snprintf(log_path, sizeof(log_path), "%s", optarg); break;
             case 1001: auto_composite = 0; break;
             case 1002: cleanup_mode = 1; break;
             case 'S': snprintf(snapshot_path, sizeof(snapshot_path), "%s", optarg); break;
@@ -166,11 +240,25 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // The service logs to a file unless told otherwise (Elegoo's init sends stdout nowhere).
+    int log_to_file = snapshot_path[0] == '\0' && strcmp(log_path, "-") != 0;
+    if (log_to_file && log_open() != 0) log_to_file = 0;
+    if (log_to_file) {
+        time_t t = time(NULL);
+        char when[32];
+        strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", localtime(&t));
+        printf("=== ai_camera %s starting at %s ===\n", GIT_VERSION, when);
+    }
+
     v4l2_camera_t camera;
     if (v4l2_camera_init(&camera, device_path, width, height, fps, quality, format, &ring) != 0) {
-        fprintf(stderr, "Error: Failed to initialize camera at %s\n", device_path);
-        frame_ring_cleanup(&ring);
-        return 1;
+        if (snapshot_path[0] != '\0') {
+            fprintf(stderr, "Error: Failed to initialize camera at %s\n", device_path);
+            frame_ring_cleanup(&ring);
+            return 1;
+        }
+        // Keep serving HTTP/IPC; the capture thread retries until the camera shows up.
+        fprintf(stderr, "[main] Camera %s not available yet, will keep retrying\n", device_path);
     }
 
     v4l2_camera_start(&camera);
@@ -201,13 +289,15 @@ int main(int argc, char **argv) {
     }
 
     printf("Starting ai_camera v%s (%s)\n", APP_VERSION, GIT_VERSION);
-    printf("Device: %s (%dx%d, format: %s)\n", device_path, camera.width, camera.height,
-           camera.pixelformat == V4L2_PIX_FMT_H264 ? "H264" : "MJPEG");
+    printf("Device: %s (%dx%d, format: %s, fps cap: %d)\n", device_path, camera.width, camera.height,
+           camera.pixelformat == V4L2_PIX_FMT_H264 ? "H264" : "MJPEG", camera.fps);
     printf("HTTP Port: %d\n", http_port);
     printf("UDS Socket: %s\n", socket_path);
 
     http_server_t http;
+    health_ctx_t health = { &camera, &ring, &http, monotonic_us() };
     if (http_server_init(&http, http_port, &ring) == 0) {
+        http_server_set_health(&http, health_json, &health);
         http_server_start(&http);
     }
 
@@ -216,8 +306,10 @@ int main(int argc, char **argv) {
         uds_ipc_start(&uds);
     }
 
+    unsigned ticks = 0;
     while (keep_running) {
         sleep(1);
+        if (log_to_file && ++ticks % 10 == 0) log_rotate_if_needed();
     }
 
     printf("Shutting down camera service...\n");
