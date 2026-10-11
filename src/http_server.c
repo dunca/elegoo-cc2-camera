@@ -55,7 +55,7 @@ static void send_simple(int fd, const char *status, const char *ctype, const cha
 }
 
 static void send_health(int fd, http_server_t *server) {
-    char body[1024];
+    char body[2048];
     if (server->health_fn) {
         server->health_fn(body, sizeof(body), server->health_user);
     } else {

@@ -23,10 +23,20 @@ The output matches the original path (56.6 dB PSNR on the YUV input).
 **Settings and endpoints.**
 - `/opt/usr/camera-quality` holds `<resolution>[@<fps>]`, e.g. `720`, `360@10`. It is read at start and applied live on `SIGHUP`: a new frame-rate cap takes effect on the next frame; a new resolution reopens the camera inside the process.
 - `GET /snapshot` returns one JPEG, or 503 when there is no recent frame.
-- `GET /health` returns JSON: resolution, fps cap, measured fps, age of the last frame, reopen count, viewers, uptime.
+- `GET /health` returns JSON: resolution, fps cap, measured fps, age of the last frame, reopen count, viewers, uptime, and the timelapse encoder's status.
 - The log goes to `/tmp/ai_camera.log` and is rotated at 256 KB.
 
 **Timelapse frames of mixed sizes**, after a resolution change mid-print, are scaled to fit. Before, they were cropped with the wrong stride.
+
+**Guarded timelapse encoding.** The printer has ~108 MB of RAM and no swap. An encode that starts while memory is short can stall for minutes and freeze the whole printer; it did once.
+- **Separate process.** The service runs the encode as a child process (`ai_camera --encoder-child -E …`), one at a time, at nice 19. The child is the kernel's first out-of-memory victim (`oom_score_adj` 1000). All of its memory (~16 MB at 720p, independent of length) goes back when it exits, and its peak is measured.
+- **Memory gate.** An encode starts only when `MemAvailable` is at least 30 MB; it re-checks every 5 s for up to 30 min. While it runs, a watchdog stops it if `MemAvailable` stays below 10 MB for 10 s. A stopped or failed encode keeps its frames and is retried once. Tune with `--encode-start-mb`, `--encode-floor-mb` and `--encode-max-wait-min`.
+- **No truncated videos.** The video is written to `<name>.mp4.part` and renamed once complete. An `.mp4` without its index (`moov`), left by an older build or a power cut, is treated as missing: it is re-encoded instead of being linked to the print and having its frames deleted.
+- **Leftover recovery.** 2 minutes after the service starts, finished timelapses still in `/opt/usr/picture` (the printer or service stopped before the encode completed) are encoded through the same guarded path.
+- **Failures are not reported to the printer.** Elegoo's `elegoo_printer` crashes on the upstream "Time-Lapse Composite Video Failed" status report.
+- **Logging.** Each encode adds one line to `/opt/usr/timelapse-encode.log` (survives reboots, rotated at 64 KB), for example:
+  `2026-10-11 17:29:32 ok 't200.mp4' frames=200 waited=0s available_at_start=51MB lowest_available=32MB encoder_peak=15MB took=29.1s size=12596082`.
+  Other outcomes are `gave_up_waiting`, `stopped_low_memory`, `killed_signal_N` and `failed`. The child's output appears in the service log prefixed `[encoder]`, and `/health` has an `encode` object: state (`idle`/`waiting`/`encoding`) and the last result, wait, memory and duration.
 
 **Printer scripts** are in [`printer/`](printer/): `camq` (set resolution and fps), an SSH forced-command wrapper for home automation, and `camwatch.sh` (restarts the service if it dies or hangs).
 

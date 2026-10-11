@@ -1,5 +1,6 @@
 #include "db_sync.h"
 #include "sqlite3.h"
+#include "timelapse_encoder.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,7 +110,15 @@ int db_sync_all_timelapses(void) {
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') continue;
-        if (!strstr(ent->d_name, ".mp4")) continue;
+        size_t n = strlen(ent->d_name);
+        if (n < 4 || strcmp(ent->d_name + n - 4, ".mp4") != 0) continue; // not .mp4.part
+
+        char full[512];
+        snprintf(full, sizeof(full), "/opt/usr/video/%s", ent->d_name);
+        if (!timelapse_mp4_is_complete(full)) {
+            printf("[db_sync] Skipping incomplete video '%s'\n", full);
+            continue;
+        }
 
         char path[512];
         snprintf(path, sizeof(path), "/opt/usr/video/%s", ent->d_name);

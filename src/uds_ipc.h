@@ -30,5 +30,7 @@ int uds_ipc_start(uds_ipc_t *ipc);
 void uds_ipc_stop(uds_ipc_t *ipc);
 void uds_ipc_broadcast(uds_ipc_t *ipc, const char *msg);
 int uds_ipc_sync_all_timelapses(const char *socket_path);
+// Encodes finished timelapses left in /opt/usr/picture, 2 minutes after the service starts.
+void uds_ipc_start_leftover_sweep(uds_ipc_t *ipc);
 
 #endif // UDS_IPC_H

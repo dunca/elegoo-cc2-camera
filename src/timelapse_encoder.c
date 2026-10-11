@@ -395,9 +395,13 @@ int timelapse_encode_directory(const char *image_dir, const char *output_mp4, in
         system(mkdir_cmd);
     }
 
-    FILE *out_f = fopen(output_mp4, "wb+");
+    // Write to <output>.part and rename when complete: the MP4 index (moov) is written last, so a
+    // file cut off by a crash or power loss is unplayable, and must never look like a finished video.
+    char part_mp4[528];
+    snprintf(part_mp4, sizeof(part_mp4), "%s.part", output_mp4);
+    FILE *out_f = fopen(part_mp4, "wb+");
     if (!out_f) {
-        fprintf(stderr, "[timelapse] Failed to create output video '%s'\n", output_mp4);
+        fprintf(stderr, "[timelapse] Failed to create output video '%s'\n", part_mp4);
         for (size_t i = 0; i < file_count; i++) free(file_list[i]);
         free(file_list);
         return -4;
@@ -408,6 +412,7 @@ int timelapse_encode_directory(const char *image_dir, const char *output_mp4, in
     if (!mux) {
         fprintf(stderr, "[timelapse] Failed to initialize MP4 muxer\n");
         fclose(out_f);
+        unlink(part_mp4);
         for (size_t i = 0; i < file_count; i++) free(file_list[i]);
         free(file_list);
         return -5;
@@ -418,6 +423,7 @@ int timelapse_encode_directory(const char *image_dir, const char *output_mp4, in
         fprintf(stderr, "[timelapse] Failed to initialize H.264 MP4 writer\n");
         MP4E_close(mux);
         fclose(out_f);
+        unlink(part_mp4);
         for (size_t i = 0; i < file_count; i++) free(file_list[i]);
         free(file_list);
         return -6;
@@ -453,6 +459,7 @@ int timelapse_encode_directory(const char *image_dir, const char *output_mp4, in
         mp4_h26x_write_close(&mp4_writer);
         MP4E_close(mux);
         fclose(out_f);
+        unlink(part_mp4);
         for (size_t i = 0; i < file_count; i++) free(file_list[i]);
         free(file_list);
         return -7;
@@ -534,13 +541,267 @@ int timelapse_encode_directory(const char *image_dir, const char *output_mp4, in
     MP4E_close(mux);
 
     long final_size = ftell(out_f);
-    fclose(out_f);
+    int write_ok = fflush(out_f) == 0 && fsync(fileno(out_f)) == 0;
+    write_ok = (fclose(out_f) == 0) && write_ok;
 
     for (size_t i = 0; i < file_count; i++) free(file_list[i]);
     free(file_list);
 
+    if (!write_ok || !timelapse_mp4_is_complete(part_mp4)) {
+        fprintf(stderr, "[timelapse] '%s' is incomplete after encoding (disk full or write error?); removed\n",
+                part_mp4);
+        unlink(part_mp4);
+        return -8;
+    }
+    if (rename(part_mp4, output_mp4) != 0) {
+        fprintf(stderr, "[timelapse] Failed to rename '%s' to '%s'\n", part_mp4, output_mp4);
+        unlink(part_mp4);
+        return -9;
+    }
+
     printf("[timelapse] Successfully created '%s' (%ld bytes)\n", output_mp4, final_size);
     return 0;
+}
+
+int timelapse_mp4_is_complete(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0) {
+        fclose(f);
+        return 0;
+    }
+    uint64_t size = (uint64_t)st.st_size, pos = 0;
+    int moov = 0, mdat = 0;
+    while (pos + 8 <= size) {
+        uint8_t h[16];
+        if (fseeko(f, (off_t)pos, SEEK_SET) != 0 || fread(h, 1, 8, f) != 8) break;
+        uint64_t box = ((uint64_t)h[0] << 24) | ((uint64_t)h[1] << 16) | ((uint64_t)h[2] << 8) | h[3];
+        if (box == 1) { // 64-bit size follows the type
+            if (fread(h + 8, 1, 8, f) != 8) break;
+            box = 0;
+            for (int i = 8; i < 16; i++) box = (box << 8) | h[i];
+        } else if (box == 0) { // box runs to the end of the file
+            box = size - pos;
+        }
+        if (box < 8 || box > size - pos) break;
+        if (memcmp(h + 4, "moov", 4) == 0) moov = 1;
+        if (memcmp(h + 4, "mdat", 4) == 0) mdat = 1;
+        pos += box;
+    }
+    fclose(f);
+    return moov && mdat && pos == size;
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Background encodes (after a print, on request, and leftovers found at startup).
+//
+// The encoder needs ~16 MB at 720p on top of the service, on a printer with ~108 MB and no swap.
+// On 11 Oct 2026 an encode that started while the printer was already short of memory stalled
+// for minutes and the whole printer thrashed until it was power-cycled. So:
+//  - one encode at a time;
+//  - it waits until MemAvailable >= start_mb (default 30 MB) before starting;
+//  - it runs in a child process (this binary, --encoder-child): its memory all goes back when it
+//    exits, it is the preferred out-of-memory victim (oom_score_adj 1000), and its peak RSS is
+//    measured;
+//  - a watchdog stops it if MemAvailable stays below floor_mb (default 10 MB) for 10 s; the
+//    frames are kept and the encode is retried once, after the memory wait again;
+//  - every encode leaves one line in TIMELAPSE_ENCODE_LOG (persistent) and in the service log.
+// ---------------------------------------------------------------------------------------------
+
+#include <spawn.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
+#include <time.h>
+#include <signal.h>
+#include <libgen.h>
+#include <stdarg.h>
+
+extern char **environ;
+
+#define MEM_POLL_S 5
+#define LOW_MEM_KILL_S 10
+#define ENCODE_LOG_MAX 65536
+#define ENCODE_ATTEMPTS 2
+
+static int mem_start_kb = 30 * 1024;
+static int mem_floor_kb = 10 * 1024;
+static int mem_max_wait_s = 30 * 60;
+
+static pthread_mutex_t encode_lock = PTHREAD_MUTEX_INITIALIZER;   // one encode at a time
+static pthread_mutex_t status_lock = PTHREAD_MUTEX_INITIALIZER;
+static timelapse_status_t status = { "idle", "", "", 0, 0, 0, 0, 0.0, 0 };
+
+void timelapse_set_memory_limits(int start_mb, int floor_mb, int max_wait_min) {
+    if (start_mb > 0) mem_start_kb = start_mb * 1024;
+    if (floor_mb > 0) mem_floor_kb = floor_mb * 1024;
+    if (max_wait_min > 0) mem_max_wait_s = max_wait_min * 60;
+}
+
+void timelapse_get_status(timelapse_status_t *out) {
+    pthread_mutex_lock(&status_lock);
+    *out = status;
+    pthread_mutex_unlock(&status_lock);
+}
+
+static void set_state(const char *state) {
+    pthread_mutex_lock(&status_lock);
+    snprintf(status.state, sizeof(status.state), "%s", state);
+    pthread_mutex_unlock(&status_lock);
+}
+
+static long mem_available_kb(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[128];
+    long kb = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
+    }
+    fclose(f);
+    return kb;
+}
+
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+// Appends one line to the persistent encode log, rotating it to .1 past ENCODE_LOG_MAX.
+static void encode_log(const char *fmt, ...) {
+    struct stat st;
+    if (stat(TIMELAPSE_ENCODE_LOG, &st) == 0 && st.st_size > ENCODE_LOG_MAX) {
+        rename(TIMELAPSE_ENCODE_LOG, TIMELAPSE_ENCODE_LOG ".1");
+    }
+    FILE *f = fopen(TIMELAPSE_ENCODE_LOG, "a");
+    char msg[768];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    time_t t = time(NULL);
+    char when[32];
+    strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", localtime(&t));
+    printf("[timelapse] %s\n", msg);
+    if (f) {
+        fprintf(f, "%s %s\n", when, msg);
+        fclose(f);
+    }
+}
+
+// Waits until MemAvailable >= mem_start_kb. Returns 0 to go ahead, -1 after mem_max_wait_s.
+static int wait_for_memory(const char *name, long *waited_s, long *avail_kb) {
+    double start = now_s(), last_log = -1e9;
+    for (;;) {
+        long avail = mem_available_kb();
+        double waited = now_s() - start;
+        *waited_s = (long)waited;
+        *avail_kb = avail;
+        if (avail < 0 || avail >= mem_start_kb) {
+            if (*waited_s > 0) {
+                printf("[timelapse] %ld MB available after waiting %ld s; starting '%s'\n",
+                       avail / 1024, *waited_s, name);
+            }
+            return 0;
+        }
+        if (waited >= mem_max_wait_s) return -1;
+        if (now_s() - last_log >= 60) {
+            printf("[timelapse] Waiting to encode '%s': %ld MB available, starts at %d MB (waited %ld s)\n",
+                   name, avail / 1024, mem_start_kb / 1024, *waited_s);
+            last_log = now_s();
+        }
+        set_state("waiting");
+        sleep(MEM_POLL_S);
+    }
+}
+
+typedef struct {
+    int spawned;           // 0: the child could not be started
+    int status;            // waitpid status
+    int low_memory_stop;   // the watchdog stopped it
+    long peak_kb;
+    long min_avail_kb;
+    int frames;
+} encode_run_t;
+
+// Runs `ai_camera --encoder-child -E <dir> -o <out>` and relays its output and progress.
+static void run_encoder_child(const char *image_dir, const char *output_mp4, int fps,
+                              timelapse_progress_cb prog_cb, void *user_data, encode_run_t *run) {
+    memset(run, 0, sizeof(*run));
+    run->min_avail_kb = -1;
+    int pfd[2];
+    if (pipe2(pfd, O_CLOEXEC) != 0) return;
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, pfd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, pfd[1], STDERR_FILENO);
+    char fps_s[16];
+    snprintf(fps_s, sizeof(fps_s), "%d", fps);
+    char *argv[] = { "ai_camera", "--encoder-child", "-E", (char *)image_dir, "-o", (char *)output_mp4,
+                     "-r", fps_s, "-l", "-", NULL };
+    pid_t pid;
+    int rc = posix_spawn(&pid, "/proc/self/exe", &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(pfd[1]);
+    if (rc != 0) {
+        fprintf(stderr, "[timelapse] Could not start the encoder process: %s\n", strerror(rc));
+        close(pfd[0]);
+        return;
+    }
+    run->spawned = 1;
+
+    // Relay the child's output line by line; check memory every 2 s.
+    char buf[1024], line[512];
+    size_t used = 0;
+    double low_since = -1;
+    struct pollfd p = { pfd[0], POLLIN, 0 };
+    for (;;) {
+        long avail = mem_available_kb();
+        if (avail >= 0 && (run->min_avail_kb < 0 || avail < run->min_avail_kb)) run->min_avail_kb = avail;
+        if (avail >= 0 && avail < mem_floor_kb) {
+            if (low_since < 0) low_since = now_s();
+            if (!run->low_memory_stop && now_s() - low_since >= LOW_MEM_KILL_S) {
+                printf("[timelapse] Only %ld MB available for %d s: stopping the encoder (pid %d)\n",
+                       avail / 1024, LOW_MEM_KILL_S, (int)pid);
+                kill(pid, SIGKILL);
+                run->low_memory_stop = 1;
+            }
+        } else {
+            low_since = -1;
+        }
+
+        int r = poll(&p, 1, 2000);
+        if (r < 0 && errno != EINTR) break;
+        if (r <= 0) continue;
+        ssize_t n = read(pfd[0], buf, sizeof(buf));
+        if (n <= 0) break; // child closed its output: it has exited
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] != '\n' && used < sizeof(line) - 1) {
+                line[used++] = buf[i];
+                continue;
+            }
+            line[used] = '\0';
+            used = 0;
+            int cur, total;
+            if (sscanf(line, "@progress %d/%d", &cur, &total) == 2) {
+                run->frames = total;
+                if (prog_cb) prog_cb(cur, total, user_data);
+            } else if (line[0]) {
+                printf("[encoder] %s\n", line);
+            }
+        }
+    }
+    close(pfd[0]);
+
+    struct rusage ru;
+    memset(&ru, 0, sizeof(ru));
+    while (wait4(pid, &run->status, 0, &ru) < 0 && errno == EINTR) {}
+    run->peak_kb = ru.ru_maxrss;
 }
 
 typedef struct {
@@ -554,13 +815,7 @@ typedef struct {
     void *user_data;
 } async_encode_args_t;
 
-#include <sys/resource.h>
-#include <unistd.h>
-
 static void *async_encode_worker(void *arg) {
-    // Avoid taking priority over printer processes
-    setpriority(PRIO_PROCESS, 0, 19);
-
     async_encode_args_t *args = (async_encode_args_t *)arg;
 
     // Optional delay to give printer time to record task completion
@@ -569,23 +824,112 @@ static void *async_encode_worker(void *arg) {
         sleep(args->delay_sec);
     }
 
-    if (args->start_cb) {
-        args->start_cb(args->output_mp4, args->user_data);
+    char name_buf[256];
+    snprintf(name_buf, sizeof(name_buf), "%s", args->output_mp4);
+    const char *name = basename(name_buf);
+
+    pthread_mutex_lock(&encode_lock);
+
+    int ok = 0, started = 0;
+    char result[32] = "failed";
+    long waited_total = 0, avail_start = -1;
+    encode_run_t run;
+    memset(&run, 0, sizeof(run));
+    double took = 0;
+
+    // Queued twice (an end-of-print encode and the startup sweep) and already done by the first one.
+    struct stat dir_st;
+    if (stat(args->image_dir, &dir_st) != 0 && timelapse_mp4_is_complete(args->output_mp4)) {
+        printf("[timelapse] '%s' was already encoded\n", name);
+        pthread_mutex_unlock(&encode_lock);
+        struct stat vst;
+        if (args->finish_cb) {
+            args->finish_cb(args->output_mp4, stat(args->output_mp4, &vst) == 0 ? (long)vst.st_size : 0, 1,
+                            args->user_data);
+        }
+        free(args);
+        return NULL;
     }
 
-    int res = timelapse_encode_directory(args->image_dir, args->output_mp4, args->fps, 0, 0,
-                                         args->prog_cb, args->user_data);
-    long sz = 0;
-    if (res == 0) {
-        FILE *f = fopen(args->output_mp4, "rb");
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            sz = ftell(f);
-            fclose(f);
+    for (int attempt = 1; attempt <= ENCODE_ATTEMPTS && !ok; attempt++) {
+        long waited = 0;
+        if (wait_for_memory(name, &waited, &avail_start) != 0) {
+            waited_total += waited;
+            snprintf(result, sizeof(result), "gave_up_waiting");
+            break;
+        }
+        waited_total += waited;
+        if (!started && args->start_cb) args->start_cb(args->output_mp4, args->user_data);
+        started = 1;
+        set_state("encoding");
+
+        double t0 = now_s();
+        run_encoder_child(args->image_dir, args->output_mp4, args->fps, args->prog_cb, args->user_data, &run);
+        if (!run.spawned) {
+            // Fall back to encoding in this process, as before (this thread only, at low priority).
+            setpriority(PRIO_PROCESS, 0, 19);
+            int res = timelapse_encode_directory(args->image_dir, args->output_mp4, args->fps, 0, 0,
+                                                 args->prog_cb, args->user_data);
+            run.peak_kb = -1;
+            ok = (res == 0);
+            took = now_s() - t0;
+            snprintf(result, sizeof(result), "%s", ok ? "ok" : "failed");
+            break;
+        }
+        took = now_s() - t0;
+        if (WIFEXITED(run.status) && WEXITSTATUS(run.status) == 0 && timelapse_mp4_is_complete(args->output_mp4)) {
+            ok = 1;
+            snprintf(result, sizeof(result), "ok");
+        } else if (run.low_memory_stop) {
+            snprintf(result, sizeof(result), "stopped_low_memory");
+        } else if (WIFSIGNALED(run.status)) {
+            snprintf(result, sizeof(result), "killed_signal_%d", WTERMSIG(run.status));
+        } else {
+            snprintf(result, sizeof(result), "failed");
+        }
+        if (!ok && attempt < ENCODE_ATTEMPTS) {
+            encode_log("%s '%s' (attempt %d, %.1f s, peak %ld MB, lowest available %ld MB); retrying",
+                       result, name, attempt, took, run.peak_kb / 1024, run.min_avail_kb / 1024);
+            set_state("waiting");
+            sleep(60);
         }
     }
+
+    long size = 0;
+    struct stat st;
+    if (ok && stat(args->output_mp4, &st) == 0) size = (long)st.st_size;
+
+    if (ok) {
+        encode_log("ok '%s' frames=%d waited=%lds available_at_start=%ldMB lowest_available=%ldMB "
+                   "encoder_peak=%ldMB took=%.1fs size=%ld",
+                   name, run.frames, waited_total, avail_start / 1024, run.min_avail_kb / 1024,
+                   run.peak_kb / 1024, took, size);
+    } else if (strcmp(result, "gave_up_waiting") == 0) {
+        encode_log("gave_up_waiting '%s': only %ld MB available after %ld s (starts at %d MB); "
+                   "frames kept in '%s'", name, avail_start / 1024, waited_total, mem_start_kb / 1024,
+                   args->image_dir);
+    } else {
+        encode_log("%s '%s' frames=%d waited=%lds lowest_available=%ldMB encoder_peak=%ldMB took=%.1fs; "
+                   "frames kept in '%s'", result, name, run.frames, waited_total, run.min_avail_kb / 1024,
+                   run.peak_kb / 1024, took, args->image_dir);
+    }
+
+    pthread_mutex_lock(&status_lock);
+    snprintf(status.state, sizeof(status.state), "idle");
+    snprintf(status.last_result, sizeof(status.last_result), "%s", result);
+    snprintf(status.last_video, sizeof(status.last_video), "%s", name);
+    status.last_wait_s = waited_total;
+    status.last_avail_kb = avail_start;
+    status.last_min_avail_kb = run.min_avail_kb;
+    status.last_peak_kb = run.peak_kb;
+    status.last_seconds = took;
+    status.last_end = (long long)time(NULL);
+    pthread_mutex_unlock(&status_lock);
+
+    pthread_mutex_unlock(&encode_lock);
+
     if (args->finish_cb) {
-        args->finish_cb(args->output_mp4, sz, (res == 0), args->user_data);
+        args->finish_cb(args->output_mp4, size, ok, args->user_data);
     }
     free(args);
     return NULL;

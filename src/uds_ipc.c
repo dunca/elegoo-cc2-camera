@@ -158,11 +158,11 @@ static void on_composite_finish(const char *output_mp4, long file_size, int succ
             system(rm_cmd);
         }
     } else {
-        fprintf(stderr, "[uds_ipc] Timelapse composite failed for '%s'\n", output_mp4);
-        char fail_report[256];
-        snprintf(fail_report, sizeof(fail_report),
-                 "{\"id\":-1,\"method\":\"status_report\",\"result\":{\"level\":\"error\",\"message\":\"Time-Lapse Composite Video Failed\"}}\x03");
-        uds_ipc_broadcast(ctx->ipc, fail_report);
+        // No status report to the printer: Elegoo's elegoo_printer crashes on "Time-Lapse Composite
+        // Video Failed" (its camera listener thread dumped core on 11 Oct 2026). The frames stay in
+        // place for the next attempt; the outcome is in the logs and /health.
+        fprintf(stderr, "[uds_ipc] Timelapse composite failed for '%s'; frames kept in '%s'\n", output_mp4,
+                ctx->target_dir);
     }
 
     free(ctx);
@@ -405,7 +405,13 @@ static void process_ipc_message(uds_ipc_t *ipc, int client_fd, const char *msg) 
             char *base_name = basename(out_copy);
 
             struct stat st_video;
-            if (stat(ctx->out_video, &st_video) == 0 && st_video.st_size > 0) {
+            int have_video = stat(ctx->out_video, &st_video) == 0 && st_video.st_size > 0;
+            if (have_video && !timelapse_mp4_is_complete(ctx->out_video)) {
+                printf("[uds_ipc] '%s' is incomplete (interrupted encode); encoding it again\n", ctx->out_video);
+                unlink(ctx->out_video);
+                have_video = 0;
+            }
+            if (have_video) {
                 // Video is already synthesized on disk (e.g. user exporting an existing MP4 to USB/storage)
                 printf("[uds_ipc] Video '%s' already exists (%lld bytes), reporting ready for export\n",
                        ctx->out_video, (long long)st_video.st_size);
@@ -665,6 +671,111 @@ void uds_ipc_stop(uds_ipc_t *ipc) {
     printf("[uds_ipc] UDS IPC server stopped\n");
 }
 
+static int has_suffix(const char *s, const char *suffix) {
+    size_t n = strlen(s), k = strlen(suffix);
+    return n >= k && strcmp(s + n - k, suffix) == 0;
+}
+
+static int count_jpegs(const char *dir_path) {
+    DIR *d = opendir(dir_path);
+    if (!d) return -1;
+    int n = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (has_suffix(ent->d_name, ".jpeg") || has_suffix(ent->d_name, ".jpg")) n++;
+    }
+    closedir(d);
+    return n;
+}
+
+// Finished timelapses whose frames are still in /opt/usr/picture (the service or the printer
+// stopped before the encode completed) are encoded once the printer has settled after startup,
+// through the normal guarded background encoder. Folders of a capture in progress (".temp") are
+// left alone.
+#define LEFTOVER_DELAY_S 120
+
+static void *leftover_sweep_proc(void *arg) {
+    uds_ipc_t *ipc = (uds_ipc_t *)arg;
+    sleep(LEFTOVER_DELAY_S);
+
+    // Interrupted .part files from earlier runs are useless; an active encode only exists after
+    // this point, since leftovers are queued below and new encodes go through the same lock.
+    DIR *vd = opendir("/opt/usr/video");
+    if (vd) {
+        struct dirent *vent;
+        while ((vent = readdir(vd)) != NULL) {
+            if (!has_suffix(vent->d_name, ".mp4.part")) continue;
+            char path[512];
+            snprintf(path, sizeof(path), "/opt/usr/video/%s", vent->d_name);
+            struct stat st;
+            if (stat(path, &st) == 0 && time(NULL) - st.st_mtime > LEFTOVER_DELAY_S) {
+                printf("[sync] Removing interrupted encode '%s'\n", path);
+                unlink(path);
+            }
+        }
+        closedir(vd);
+    }
+
+    DIR *d = opendir("/opt/usr/picture");
+    if (!d) return NULL;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.' || has_suffix(ent->d_name, ".temp")) continue;
+        composite_callback_ctx_t *ctx = malloc(sizeof(*ctx));
+        if (!ctx) break;
+        ctx->ipc = ipc;
+        snprintf(ctx->target_dir, sizeof(ctx->target_dir), "/opt/usr/picture/%s", ent->d_name);
+        snprintf(ctx->out_video, sizeof(ctx->out_video), "/opt/usr/video/%s.mp4", ent->d_name);
+        struct stat st;
+        if (stat(ctx->target_dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
+            strcmp(ctx->target_dir, ipc->current_lapse_dir) == 0) {
+            free(ctx);
+            continue;
+        }
+        if (count_jpegs(ctx->target_dir) == 0) {
+            printf("[sync] Removing empty timelapse folder '%s'\n", ctx->target_dir);
+            char rm_cmd[300];
+            snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf \"%s\"", ctx->target_dir);
+            system(rm_cmd);
+            free(ctx);
+            continue;
+        }
+        if (timelapse_mp4_is_complete(ctx->out_video)) {
+            // Encoded, but the bookkeeping never ran: link it and remove the frames.
+            struct stat vst;
+            long size = stat(ctx->out_video, &vst) == 0 ? (long)vst.st_size : 0;
+            printf("[sync] '%s' is already encoded; linking it and removing its frames\n", ctx->out_video);
+            on_composite_finish(ctx->out_video, size, 1, ctx);
+            continue;
+        }
+        char part[300];
+        snprintf(part, sizeof(part), "%s.part", ctx->out_video);
+        if (stat(part, &st) == 0) { // being encoded right now
+            free(ctx);
+            continue;
+        }
+        unlink(ctx->out_video); // incomplete leftover, if any
+        printf("[sync] Leftover timelapse frames in '%s'; queueing the encode\n", ctx->target_dir);
+        if (timelapse_encode_directory_async(ctx->target_dir, ctx->out_video, 15, 0, on_composite_start,
+                                             on_composite_progress, on_composite_finish, ctx) != 0) {
+            free(ctx);
+        }
+    }
+    closedir(d);
+    return NULL;
+}
+
+void uds_ipc_start_leftover_sweep(uds_ipc_t *ipc) {
+    pthread_t thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&thread, &attr, leftover_sweep_proc, ipc) != 0) {
+        fprintf(stderr, "[sync] Could not start the leftover timelapse sweep\n");
+    }
+    pthread_attr_destroy(&attr);
+}
+
 int uds_ipc_sync_all_timelapses(const char *socket_path) {
     printf("[sync] Scanning /opt/usr/picture for unencoded timelapses...\n");
 
@@ -687,6 +798,10 @@ int uds_ipc_sync_all_timelapses(const char *socket_path) {
                 snprintf(out_mp4, sizeof(out_mp4), "/opt/usr/video/%s.mp4", clean_name);
 
                 struct stat st_v;
+                if (stat(out_mp4, &st_v) == 0 && st_v.st_size > 0 && !timelapse_mp4_is_complete(out_mp4)) {
+                    printf("[sync] '%s' is incomplete (interrupted encode); encoding it again\n", out_mp4);
+                    unlink(out_mp4);
+                }
                 if (stat(out_mp4, &st_v) != 0 || st_v.st_size == 0) {
                     printf("[sync] Encoding timelapse directory: '%s' -> '%s'\n", pic_dir, out_mp4);
                     int res = timelapse_encode_directory(pic_dir, out_mp4, 15, 0, 0, NULL, NULL);
@@ -730,7 +845,7 @@ int uds_ipc_sync_all_timelapses(const char *socket_path) {
             if (vd) {
                 struct dirent *vent;
                 while ((vent = readdir(vd)) != NULL) {
-                    if (strstr(vent->d_name, ".mp4")) {
+                    if (has_suffix(vent->d_name, ".mp4")) {
                         char vpath[512];
                         snprintf(vpath, sizeof(vpath), "/opt/usr/video/%s", vent->d_name);
                         struct stat vst;
