@@ -125,14 +125,14 @@ static int health_json(char *buf, size_t len, void *user) {
         "\"width\":%d,\"height\":%d,\"format\":\"%s\",\"fps_cap\":%d,\"fps\":%.1f,"
         "\"frames\":%llu,\"last_frame_age_ms\":%lld,\"camera_reopens\":%u,\"open_failures\":%d,"
         "\"stream_clients\":%d,\"uptime_s\":%llu,"
-        "\"encode\":{\"state\":\"%s\",\"last_result\":\"%s\",\"last_video\":\"%s\",\"last_wait_s\":%ld,"
+        "\"encode\":{\"state\":\"%s\",\"last_result\":\"%s\",\"last_video\":\"%s\","
         "\"last_available_kb\":%ld,\"last_lowest_available_kb\":%ld,\"last_peak_kb\":%ld,"
         "\"last_seconds\":%.1f,\"last_end\":%lld}}\n",
         ok ? "true" : "false", GIT_VERSION, h->camera->device_path, streaming ? "true" : "false",
         h->camera->width, h->camera->height, fourcc, h->camera->fps, fps,
         (unsigned long long)total, age_ms, h->camera->reopens, h->camera->open_failures,
         h->http->stream_clients, (unsigned long long)((now - h->start_us) / 1000000ULL),
-        enc.state, enc.last_result, video, enc.last_wait_s, enc.last_avail_kb, enc.last_min_avail_kb,
+        enc.state, enc.last_result, video, enc.last_avail_kb, enc.last_min_avail_kb,
         enc.last_peak_kb, enc.last_seconds, enc.last_end);
 }
 
@@ -157,9 +157,6 @@ static void print_usage(const char *prog_name) {
     printf("  -f, --format STR           Format: H264 or MJPEG (default: MJPEG)\n");
     printf("      --no-auto-composite    Disable automatic background MP4 encoding on print stop\n");
     printf("      --cleanup              Encode uncompressed timelapses, sync database records, and exit\n");
-    printf("      --encode-start-mb INT  Start a background timelapse encode only with this much MemAvailable (default 30)\n");
-    printf("      --encode-floor-mb INT  Stop the encoder if MemAvailable stays below this for 10 s (default 10)\n");
-    printf("      --encode-max-wait-min INT  Give up waiting for memory after this long; frames are kept (default 30)\n");
     printf("  -S, --snapshot PATH        (for testing) Capture a single frame to PATH and exit\n");
     printf("  -E, --encode-timelapse DIR (for testing) Encode directory of JPEGs to MP4 and exit\n");
     printf("  -o, --output PATH          Output MP4 file path for timelapse encoding\n");
@@ -180,7 +177,6 @@ int main(int argc, char **argv) {
     int auto_composite = 1;
     int cleanup_mode = 0;
     int encoder_child = 0;   // internal: the background encoder process started by the service
-    int enc_start_mb = 0, enc_floor_mb = 0, enc_wait_min = 0;
     char socket_path[128] = "/tmp/aicamera_uds";
     char snapshot_path[256] = {0};
     char encode_dir[256] = {0};
@@ -202,9 +198,6 @@ int main(int argc, char **argv) {
         {"no-auto-composite", no_argument, 0, 1001},
         {"cleanup", no_argument, 0, 1002},
         {"encoder-child", no_argument, 0, 1003},
-        {"encode-start-mb", required_argument, 0, 1004},
-        {"encode-floor-mb", required_argument, 0, 1005},
-        {"encode-max-wait-min", required_argument, 0, 1006},
         {"snapshot", required_argument, 0, 'S'},
         {"encode-timelapse", required_argument, 0, 'E'},
         {"output", required_argument, 0, 'o'},
@@ -227,9 +220,6 @@ int main(int argc, char **argv) {
             case 1001: auto_composite = 0; break;
             case 1002: cleanup_mode = 1; break;
             case 1003: encoder_child = 1; break;
-            case 1004: enc_start_mb = atoi(optarg); break;
-            case 1005: enc_floor_mb = atoi(optarg); break;
-            case 1006: enc_wait_min = atoi(optarg); break;
             case 'S': snprintf(snapshot_path, sizeof(snapshot_path), "%s", optarg); break;
             case 'E': snprintf(encode_dir, sizeof(encode_dir), "%s", optarg); break;
             case 'o': snprintf(output_mp4, sizeof(output_mp4), "%s", optarg); break;
@@ -249,8 +239,6 @@ int main(int argc, char **argv) {
                 return (opt == '?') ? 0 : 1;
         }
     }
-
-    timelapse_set_memory_limits(enc_start_mb, enc_floor_mb, enc_wait_min);
 
     if (cleanup_mode) {
         return uds_ipc_sync_all_timelapses(socket_path);
@@ -284,7 +272,7 @@ int main(int argc, char **argv) {
             return 0;
         } else {
             fprintf(stderr, "[TEST MODE] Timelapse encoding failed with error code %d\n", res);
-            return 1;
+            return res == TIMELAPSE_ERR_NO_FRAMES ? 2 : 1;
         }
     }
 
